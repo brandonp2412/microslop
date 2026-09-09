@@ -250,6 +250,25 @@ Future<GlobalKey> _pumpApp(
   return boundaryKey;
 }
 
+String _flutterRoot() {
+  final configured = Platform.environment['FLUTTER_ROOT']?.trim();
+  if (configured?.isNotEmpty == true) {
+    return configured!;
+  }
+
+  final result = Process.runSync(Platform.isWindows ? 'where' : 'which', [
+    'flutter',
+  ]);
+  if (result.exitCode != 0) {
+    throw StateError('Unable to locate Flutter SDK for screenshot fonts.');
+  }
+
+  final executable = File(
+    (result.stdout as String).split(RegExp(r'[\r\n]+')).first.trim(),
+  ).resolveSymbolicLinksSync();
+  return File(executable).parent.parent.path;
+}
+
 Future<void> _loadScreenshotFont() async {
   final configured = Platform.environment['MICROSLOP_SCREENSHOT_FONT'];
   final candidates = [
@@ -266,6 +285,44 @@ Future<void> _loadScreenshotFont() async {
   final bytes = await File(path).readAsBytes();
   await (FontLoader(
     'Arial',
+  )..addFont(Future.value(ByteData.sublistView(bytes)))).load();
+}
+
+Future<void> _loadEmojiFont() async {
+  final candidates = <(String, String)>[
+    ('/usr/share/fonts/noto/NotoColorEmoji.ttf', 'Noto Color Emoji'),
+    ('/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf', 'Noto Color Emoji'),
+    (r'C:\Windows\Fonts\seguiemj.ttf', 'Segoe UI Emoji'),
+  ];
+  for (final (path, family) in candidates) {
+    final file = File(path);
+    if (!file.existsSync()) continue;
+    final bytes = await file.readAsBytes();
+    await (FontLoader(
+      family,
+    )..addFont(Future.value(ByteData.sublistView(bytes)))).load();
+    return;
+  }
+}
+
+Future<void> _loadMaterialIconsFont() async {
+  final separator = Platform.pathSeparator;
+  final path = [
+    _flutterRoot(),
+    'bin',
+    'cache',
+    'artifacts',
+    'material_fonts',
+    'MaterialIcons-Regular.otf',
+  ].join(separator);
+  final file = File(path);
+  if (!file.existsSync()) {
+    throw StateError('Material Icons font not found at $path.');
+  }
+
+  final bytes = await file.readAsBytes();
+  await (FontLoader(
+    'MaterialIcons',
   )..addFont(Future.value(ByteData.sublistView(bytes)))).load();
 }
 
@@ -297,6 +354,8 @@ void main() {
 
   setUpAll(() async {
     await _loadScreenshotFont();
+    await _loadEmojiFont();
+    await _loadMaterialIconsFont();
     final directory = Directory('build/ui-screenshots');
     if (await directory.exists()) await directory.delete(recursive: true);
   });

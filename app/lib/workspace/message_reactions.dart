@@ -1,6 +1,11 @@
 part of '../workspace.dart';
 
 final _mentionPattern = RegExp(r'@([\p{L}\p{N}_.-]*)$', unicode: true);
+const _emojiFontFallback = <String>[
+  'Noto Color Emoji',
+  'Apple Color Emoji',
+  'Segoe UI Emoji',
+];
 
 class _ReactionTray extends StatelessWidget {
   const _ReactionTray({
@@ -172,13 +177,21 @@ class _ReactionTrayItemState extends State<_ReactionTrayItem> {
                             gaplessPlayback: true,
                             errorBuilder: (_, _, _) => Text(
                               label,
-                              style: const TextStyle(fontSize: 15, height: 1),
+                              style: const TextStyle(
+                                fontSize: 15,
+                                height: 1,
+                                fontFamilyFallback: _emojiFontFallback,
+                              ),
                             ),
                           )
                         else
                           Text(
                             label,
-                            style: const TextStyle(fontSize: 15, height: 1),
+                            style: const TextStyle(
+                              fontSize: 15,
+                              height: 1,
+                              fontFamilyFallback: _emojiFontFallback,
+                            ),
                           ),
                         const SizedBox(width: 3),
                         Text(
