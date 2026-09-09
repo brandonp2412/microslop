@@ -13,7 +13,6 @@ https://graph.microsoft.com/beta/
 
 - `/me` - Current user profile
 - `/me/chats` - User's chats
-- `/me/presence` - User's presence status
 - `/teams` - Teams and channels
 
 ## Related Terms

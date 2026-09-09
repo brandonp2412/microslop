@@ -14,7 +14,6 @@ use tokio::time;
 use crate::calling;
 use crate::config::Config;
 
-/// Reason the inner connection loop exited.
 enum DisconnectReason {
     /// Clean shutdown (Ctrl+C). Do not reconnect.
     Shutdown,
@@ -36,7 +35,6 @@ pub async fn connect_and_run() -> Result<()> {
                 return Ok(());
             }
             Ok(DisconnectReason::Error(e)) => {
-                // Connection was stable (>60s), reset backoff before reconnecting.
                 backoff = 1;
                 tracing::warn!(
                     "Trouter disconnected after stable session: {:#}. Reconnecting in 1s...",
@@ -100,7 +98,6 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
     // 3. Connect WebSocket (auth is via session ID in URL, no headers needed)
     let mut ws = websocket::TrouterSocket::connect(&session, &session_id, &epid).await?;
 
-    // 4. Wait for handshake frame (1::)
     let frame = ws
         .recv_frame()
         .await?
@@ -112,7 +109,6 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
         tracing::info!("Received handshake frame");
     }
 
-    // 5. Register with registrar
     let registrar_ttl_secs: u64 = 86400;
     if let Some(ref reg_url) = session.registrar_url {
         if let Err(e) = registrar::register(&http, skype_token_str, reg_url, &session.surl).await {
@@ -120,23 +116,17 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
         }
     }
 
-    // 6. Event loop: recv frames, send heartbeat, re-register before TTL,
-    //    force reconnect after session max age.
     let connected_at = Instant::now();
-    let mut heartbeat = time::interval(Duration::from_secs(30));
-    heartbeat.tick().await; // skip first immediate tick
 
     // Re-register 30s before TTL expires.
     let re_register_interval = Duration::from_secs(registrar_ttl_secs.saturating_sub(30));
     let mut re_register_deadline = Box::pin(time::sleep(re_register_interval));
 
-    // Force full reconnect after 1 hour to refresh the session.
     // The session TTL is typically ~589000s but rotating more frequently
     // keeps tokens and registrations fresh.
     let session_max_age = Duration::from_secs(3600);
     let mut session_deadline = Box::pin(time::sleep(session_max_age));
 
-    // Stability threshold: reset backoff after 60s of successful connection.
     // We communicate this via the return value — the caller checks timing.
     let stability_threshold = Duration::from_secs(60);
 
@@ -155,11 +145,6 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
                     }
                 }
             }
-            _ = heartbeat.tick() => {
-                if let Err(e) = ws.send_text("2::").await {
-                    break DisconnectReason::Error(e.context("Heartbeat send failed"));
-                }
-            }
             _ = &mut re_register_deadline => {
                 tracing::info!("Re-registering with registrar (TTL refresh)");
                 if let Some(ref reg_url) = session.registrar_url {
@@ -173,7 +158,6 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
                         }
                     });
                 }
-                // Reset the timer for another cycle.
                 re_register_deadline = Box::pin(time::sleep(re_register_interval));
             }
             _ = &mut session_deadline => {
@@ -191,8 +175,6 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
     // We do this by returning Ok (the caller pattern-matches on it).
     if connected_at.elapsed() >= stability_threshold {
         // Reset backoff indirectly: caller sees Ok and resets.
-        // But we still need to convey the reason.
-        // Use Ok for both shutdown and stable-error cases.
         return Ok(disconnect_reason);
     }
 
@@ -205,9 +187,7 @@ async fn connect_and_run_inner() -> Result<DisconnectReason> {
 /// Handle an incoming socket.io frame.
 async fn handle_frame(frame: &str, http: &reqwest::Client, skype_token: &str) {
     // socket.io framing:
-    // 1:: — handshake (handled above)
     // 2:: — heartbeat ping (server)
-    // 3::: — ephemeral message
     // 5:X::{json} — event
     // 6:X+::{json} — ack event
 
@@ -220,7 +200,7 @@ async fn handle_frame(frame: &str, http: &reqwest::Client, skype_token: &str) {
         // Socket.IO v1 event frame: 5:ACK_ID:ENDPOINT:JSON
         // Ack (6:ID::) is sent automatically by recv_frame() in websocket.rs.
         // Here we just extract the JSON payload after the `::` separator.
-        let after_5 = &frame[2..]; // skip "5:"
+        let after_5 = &frame[2..];
         let json_str = after_5
             .find("::")
             .map(|pos| &after_5[pos + 2..])
@@ -326,7 +306,6 @@ async fn handle_call_event(json_str: &str, http: &reqwest::Client, skype_token: 
         }
     };
 
-    // Gather relay candidate if we have credentials.
     let relay_candidate = if let Some(ref config) = relay_config {
         match calling::turn::gather_relay_candidate(config).await {
             Some((candidate, _client)) => {
@@ -366,7 +345,6 @@ async fn handle_call_event(json_str: &str, http: &reqwest::Client, skype_token: 
                                 .find_map(|line| calling::srtp::parse_crypto_line(line).ok())
                         });
 
-                        // Build local candidates list (relay if available).
                         let mut local_cands: Vec<calling::ice::IceCandidate> = Vec::new();
                         if let Some(ref rc) = relay_candidate {
                             local_cands.push(rc.clone());
@@ -481,7 +459,7 @@ async fn handle_call_event(json_str: &str, http: &reqwest::Client, skype_token: 
                                 (local_video_crypto, remote_video_crypto)
                             {
                                 let vid_candidates =
-                                    calling::ice::parse_candidates_from_sdp_section(blob, "video");
+                                    calling::ice::parse_main_video_candidates_from_sdp(blob);
                                 if let Some(remote_addr) =
                                     calling::ice::select_remote_candidate(&vid_candidates)
                                 {
@@ -546,8 +524,7 @@ async fn handle_call_event(json_str: &str, http: &reqwest::Client, skype_token: 
         }
     }
 
-    // Send acceptance.
-    if let Err(e) = calling::signaling::accept_call(http, skype_token, &notification).await {
+    if let Err(e) = calling::signaling::accept_call(http, skype_token, &notification, false).await {
         tracing::warn!("Failed to accept call: {:#}", e);
     }
 }

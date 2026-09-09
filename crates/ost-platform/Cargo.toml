@@ -1,0 +1,16 @@
+[package]
+name = "ost-platform"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+directories = "5"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = "4.1.6"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1.0.0"
+jni = "0.21"
+keyring-core = "1.0.0"

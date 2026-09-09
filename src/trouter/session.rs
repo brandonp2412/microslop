@@ -1,112 +1,9 @@
 //! Trouter v4 session negotiation
 
 use anyhow::{Context, Result};
-use serde::de;
-use serde::Deserialize;
+use ost_microsoft::calling as microsoft_calling;
 
-fn string_or_u64<'de, D: de::Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
-    struct Visitor;
-    impl<'de> de::Visitor<'de> for Visitor {
-        type Value = u64;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("u64 or stringified u64")
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<u64, E> {
-            Ok(v)
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<u64, E> {
-            v.parse().map_err(E::custom)
-        }
-    }
-    d.deserialize_any(Visitor)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ConnectParams {
-    pub sr: String,
-    pub issuer: String,
-    pub sp: String,
-    pub se: String,
-    pub st: String,
-    pub sig: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionResponse {
-    pub socketio: String,
-    pub surl: String,
-    pub url: String,
-    #[serde(deserialize_with = "string_or_u64")]
-    pub ttl: u64,
-    pub connectparams: ConnectParams,
-    pub ccid: Option<String>,
-    #[serde(default)]
-    pub registrar_url: Option<String>,
-}
-
-impl SessionResponse {
-    /// Build URL query string for connectparams (URL-encoded).
-    fn connectparams_query(&self) -> String {
-        let cp = &self.connectparams;
-        let e = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-        format!(
-            "sr={}&issuer={}&sp={}&se={}&st={}&sig={}",
-            e(&cp.sr),
-            e(&cp.issuer),
-            e(&cp.sp),
-            e(&cp.se),
-            e(&cp.st),
-            e(&cp.sig),
-        )
-    }
-
-    /// Build the socket.io session URL for GET (step 1: obtain session ID).
-    pub fn session_url(&self, epid: &str) -> String {
-        let host = self.socketio.trim_end_matches('/');
-        let cp_query = self.connectparams_query();
-        let e = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-
-        let tc =
-            r#"{"cv":"TEAMS_TROUTER_TCCV","ua":"TeamsCDL","hr":"","v":"TEAMS_CLIENTINFO_VERSION"}"#;
-
-        let mut url = format!(
-            "{}/socket.io/1/?v=v4&{}&tc={}&con_num=0_1&auth=true&timeout=40&epid={}",
-            host,
-            cp_query,
-            e(tc),
-            e(epid),
-        );
-
-        if let Some(ref ccid) = self.ccid {
-            url.push_str(&format!("&ccid={}", e(ccid)));
-        }
-
-        url
-    }
-
-    /// Build the WebSocket URL given a session ID (step 2: connect WS).
-    pub fn ws_url(&self, session_id: &str, epid: &str) -> String {
-        let host = self.socketio.trim_end_matches('/');
-        let cp_query = self.connectparams_query();
-        let e = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-
-        let tc =
-            r#"{"cv":"TEAMS_TROUTER_TCCV","ua":"TeamsCDL","hr":"","v":"TEAMS_CLIENTINFO_VERSION"}"#;
-
-        let mut url =
-            format!(
-            "{}/socket.io/1/websocket/{}?v=v4&{}&tc={}&con_num=0_1&auth=true&timeout=40&epid={}",
-            host, session_id, cp_query, e(tc), e(epid),
-        );
-
-        if let Some(ref ccid) = self.ccid {
-            url.push_str(&format!("&ccid={}", e(ccid)));
-        }
-
-        url
-    }
-}
+pub use microsoft_calling::TrouterSession as SessionResponse;
 
 /// Negotiate a Trouter session, returning connection parameters.
 pub async fn negotiate(
@@ -114,13 +11,13 @@ pub async fn negotiate(
     skype_token: &str,
 ) -> Result<(SessionResponse, String)> {
     let epid = uuid::Uuid::new_v4().to_string();
-    let url = format!("https://go.trouter.teams.microsoft.com/v4/a?epid={}", epid);
+    let url = microsoft_calling::trouter_negotiation_url(&epid);
 
     tracing::info!("Negotiating trouter session (epid={})", epid);
 
     let resp = http
         .get(&url)
-        .header("X-Skypetoken", skype_token)
+        .header(microsoft_calling::SKYPE_TOKEN_HEADER, skype_token)
         .send()
         .await
         .context("Trouter session negotiation request failed")?;
@@ -144,7 +41,7 @@ pub async fn negotiate(
 
 /// Get a socket.io session ID by sending an authenticated GET request.
 pub async fn get_session_id(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     session: &SessionResponse,
     skype_token: &str,
     epid: &str,
@@ -162,7 +59,7 @@ pub async fn get_session_id(
 
     let resp = no_redirect
         .get(&url)
-        .header("X-Skypetoken", skype_token)
+        .header(microsoft_calling::SKYPE_TOKEN_HEADER, skype_token)
         .send()
         .await
         .context("Socket.io session request failed")?;

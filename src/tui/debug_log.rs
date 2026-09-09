@@ -7,6 +7,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 
 use super::log_capture::LogBuffer;
 
@@ -17,11 +21,8 @@ use super::log_capture::LogBuffer;
 /// while this limit controls how much history the user can scroll through.
 const MAX_ACCUMULATED_LINES: usize = 1000;
 
-/// State for the debug log pane.
 pub struct DebugLogState {
-    /// The ring buffer receiving log output from tracing.
     buffer: LogBuffer,
-    /// Accumulated log lines (drains from buffer each refresh).
     lines: Vec<String>,
     /// Whether the debug log pane is visible.
     pub visible: bool,
@@ -40,55 +41,82 @@ impl DebugLogState {
         }
     }
 
-    /// Drain new lines from the ring buffer into accumulated lines.
     ///
     /// Call this every event loop iteration to prevent unbounded mutex growth.
     pub fn refresh(&mut self) {
-        let new_lines = self.buffer.drain();
+        let new_lines = self
+            .buffer
+            .drain()
+            .into_iter()
+            .filter(|line| is_error_log_line(line))
+            .collect::<Vec<_>>();
         if !new_lines.is_empty() {
             self.lines.extend(new_lines);
-            // Cap accumulated lines.
             if self.lines.len() > MAX_ACCUMULATED_LINES {
                 let excess = self.lines.len() - MAX_ACCUMULATED_LINES;
                 self.lines.drain(..excess);
-                // Adjust scroll offset to stay valid.
                 self.scroll_offset = self.scroll_offset.saturating_sub(excess);
             }
         }
     }
 
-    /// Toggle visibility of the debug log pane.
     ///
     /// When opening, auto-scroll to the bottom (most recent logs).
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
         if self.visible {
-            // Auto-scroll to bottom.
             self.scroll_offset = 0;
         }
     }
 
-    /// Scroll up by n lines (toward older logs).
-    ///
-    /// Clamps to prevent scrolling past the oldest line.
     pub fn scroll_up(&mut self, n: usize) {
         let max_offset = self.lines.len().saturating_sub(1);
         self.scroll_offset = self.scroll_offset.saturating_add(n).min(max_offset);
     }
 
-    /// Scroll down by n lines (toward newer logs).
     pub fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
-    /// Get the current line count.
+    /// Return the complete log in a clipboard-friendly format.
+    pub fn copy_text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Copy the complete log to the platform clipboard.
+    pub fn copy_to_clipboard(&self) -> std::io::Result<()> {
+        let mut command = if cfg!(target_os = "macos") {
+            Command::new("pbcopy")
+        } else if cfg!(target_os = "windows") {
+            Command::new("clip")
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            Command::new("wl-copy")
+        } else {
+            let mut command = Command::new("xclip");
+            command.args(["-selection", "clipboard"]);
+            command
+        };
+        let mut child = command.stdin(Stdio::piped()).spawn()?;
+        child
+            .stdin
+            .take()
+            .expect("clipboard stdin configured")
+            .write_all(self.copy_text().as_bytes())?;
+        child.wait().and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("clipboard command failed"))
+            }
+        })
+    }
+
     #[cfg(test)]
     pub fn line_count(&self) -> usize {
         self.lines.len()
     }
 }
 
-/// Render the debug log pane.
 pub fn render(area: Rect, buf: &mut Buffer, state: &DebugLogState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -98,6 +126,10 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &DebugLogState) {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " c Copy logs  PgUp/PgDn Scroll ",
+            Style::default().fg(Color::Gray),
         ));
 
     let inner = block.inner(area);
@@ -110,9 +142,6 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &DebugLogState) {
     let visible_lines = inner.height as usize;
     let total_lines = state.lines.len();
 
-    // Calculate which lines to show.
-    // scroll_offset=0 means show the last `visible_lines` lines.
-    // scroll_offset=N means show lines ending N lines earlier.
     let end_idx = total_lines.saturating_sub(state.scroll_offset);
     let start_idx = end_idx.saturating_sub(visible_lines);
 
@@ -125,30 +154,28 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &DebugLogState) {
     para.render(inner, buf);
 }
 
-/// Parse a log line and colorize based on level prefix.
-///
-/// tracing-subscriber fmt layer outputs lines like:
-/// "2024-01-15T10:30:00Z  INFO token refresh succeeded"
-/// "2024-01-15T10:30:00Z DEBUG fetching chats"
-/// "2024-01-15T10:30:00Z  WARN connection slow"
-/// "2024-01-15T10:30:00Z ERROR failed to connect"
-fn colorize_log_line(line: &str) -> Line<'static> {
-    // Look for level indicators in the line.
+fn colorize_log_line(line: &str) -> Line<'_> {
     let color = if line.contains(" ERROR ") || line.contains("ERROR:") {
         Color::Red
     } else if line.contains(" WARN ") || line.contains("WARN:") {
         Color::Yellow
     } else if line.contains(" INFO ") || line.contains("INFO:") {
         Color::Green
-    } else if line.contains(" DEBUG ") || line.contains("DEBUG:") {
-        Color::DarkGray
-    } else if line.contains(" TRACE ") || line.contains("TRACE:") {
+    } else if line.contains(" DEBUG ")
+        || line.contains("DEBUG:")
+        || line.contains(" TRACE ")
+        || line.contains("TRACE:")
+    {
         Color::DarkGray
     } else {
         Color::White
     };
 
-    Line::from(Span::styled(line.to_owned(), Style::default().fg(color)))
+    Line::from(Span::styled(line, Style::default().fg(color)))
+}
+
+fn is_error_log_line(line: &str) -> bool {
+    line.contains(" ERROR ") || line.contains("ERROR:") || line.starts_with("ERROR ")
 }
 
 #[cfg(test)]
@@ -156,10 +183,37 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
+    fn benchmark_log_line_borrowing() {
+        use std::{hint::black_box, time::Instant};
+
+        let line =
+            "2026-09-09 INFO Teams message activity stream received a representative log line";
+        let rounds = 1_000_000;
+        let style = Style::default().fg(Color::Green);
+        let start = Instant::now();
+        for _ in 0..rounds {
+            black_box(Line::from(Span::styled(line.to_owned(), style)));
+        }
+        let owned = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..rounds {
+            black_box(Line::from(Span::styled(line, style)));
+        }
+        let borrowed = start.elapsed();
+        eprintln!(
+            "log_line_render owned_us={} borrowed_us={} gain={:.1}%",
+            owned.as_micros(),
+            borrowed.as_micros(),
+            (owned.as_secs_f64() - borrowed.as_secs_f64()) * 100.0 / owned.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn test_debug_log_refresh() {
         let buffer = LogBuffer::new();
-        buffer.push("line 1".to_string());
-        buffer.push("line 2".to_string());
+        buffer.push("ERROR line 1".to_string());
+        buffer.push("ERROR line 2".to_string());
 
         let mut state = DebugLogState::new(buffer.clone());
         assert_eq!(state.line_count(), 0);
@@ -167,8 +221,7 @@ mod tests {
         state.refresh();
         assert_eq!(state.line_count(), 2);
 
-        // Add more lines.
-        buffer.push("line 3".to_string());
+        buffer.push("ERROR line 3".to_string());
         state.refresh();
         assert_eq!(state.line_count(), 3);
     }
@@ -188,12 +241,11 @@ mod tests {
     #[test]
     fn test_debug_log_scroll() {
         let buffer = LogBuffer::new();
-        // Add some lines so we have something to scroll.
         for i in 0..20 {
-            buffer.push(format!("line {}", i));
+            buffer.push(format!("ERROR line {}", i));
         }
         let mut state = DebugLogState::new(buffer);
-        state.refresh(); // Pull lines into state.
+        state.refresh();
 
         state.scroll_up(5);
         assert_eq!(state.scroll_offset, 5);
@@ -208,16 +260,57 @@ mod tests {
     #[test]
     fn test_debug_log_scroll_clamps() {
         let buffer = LogBuffer::new();
-        // Add only 5 lines.
         for i in 0..5 {
-            buffer.push(format!("line {}", i));
+            buffer.push(format!("ERROR line {}", i));
         }
         let mut state = DebugLogState::new(buffer);
         state.refresh();
 
-        // Try to scroll up way past the content.
         state.scroll_up(100);
-        // Should be clamped to max (line_count - 1 = 4).
         assert_eq!(state.scroll_offset, 4);
+    }
+
+    #[test]
+    fn test_copy_text_contains_all_log_lines() {
+        let buffer = LogBuffer::new();
+        buffer.push("ERROR first line".to_string());
+        buffer.push("ERROR second line".to_string());
+        let mut state = DebugLogState::new(buffer);
+        state.refresh();
+
+        assert_eq!(state.copy_text(), "ERROR first line\nERROR second line");
+    }
+
+    #[test]
+    fn test_refresh_keeps_only_error_logs() {
+        let buffer = LogBuffer::new();
+        buffer.push("2026-08-29 INFO normal activity".to_string());
+        buffer.push("2026-08-29 ERROR request failed".to_string());
+        buffer.push("2026-08-29 WARN recoverable issue".to_string());
+        let mut state = DebugLogState::new(buffer);
+
+        state.refresh();
+
+        assert_eq!(state.copy_text(), "2026-08-29 ERROR request failed");
+    }
+
+    #[test]
+    fn test_render_shows_copy_action() {
+        let state = DebugLogState::new(LogBuffer::new());
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buffer = Buffer::empty(area);
+
+        render(area, &mut buffer, &state);
+
+        let rendered: String = (0..area.width)
+            .map(|x| {
+                buffer[(x, area.height - 1)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
+        assert!(rendered.contains("c Copy"));
     }
 }

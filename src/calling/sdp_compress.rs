@@ -9,21 +9,21 @@
 //!
 //! Compression is only applied when the SDP is >= 1201 bytes.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 
 /// SDP compression dictionary extracted from libSkyLib.so at offset 0x1ff6d4.
 /// This 20623-byte string contains representative SDP/HTTP content that the
 /// deflate algorithm uses as a preset dictionary for better compression.
-const SDP_DICTIONARY: &[u8; 20623] = include_bytes!("sdp_dictionary.bin");
+const SDP_DICTIONARY: &[u8] = include_bytes!("sdp_dictionary.bin");
 
 /// Minimum SDP size for compression (from binary analysis at 0x009adaf0).
 const COMPRESSION_THRESHOLD: usize = 1201;
+const MAX_DECOMPRESSED_SDP_SIZE: usize = 1024 * 1024;
 
 /// Decompress an SDP blob from Teams wire format.
 ///
-/// Handles three cases:
 /// 1. Already plaintext SDP (starts with "v=") -- returned as-is
 /// 2. Base64-encoded raw-deflated SDP without dictionary
 /// 3. Base64-encoded raw-deflated SDP with the preset dictionary
@@ -31,6 +31,9 @@ const COMPRESSION_THRESHOLD: usize = 1201;
 /// Returns the decompressed SDP string, or an error if decompression fails.
 pub fn decompress_sdp(blob: &str) -> Result<String> {
     let trimmed = blob.trim();
+    if trimmed.is_empty() {
+        bail!("SDP blob is empty");
+    }
 
     // Already plaintext SDP
     if trimmed.starts_with("v=") {
@@ -48,9 +51,8 @@ pub fn decompress_sdp(blob: &str) -> Result<String> {
         _ => {}
     }
 
-    // Try with the preset dictionary
-    match raw_inflate(&raw, Some(SDP_DICTIONARY.as_slice())) {
-        Ok(sdp) if sdp.starts_with("v=") => return Ok(sdp),
+    match raw_inflate(&raw, Some(SDP_DICTIONARY)) {
+        Ok(sdp) if sdp.starts_with("v=") => Ok(sdp),
         Ok(sdp) => anyhow::bail!(
             "Decompressed data does not look like SDP (starts with {:?})",
             &sdp[..sdp.len().min(20)]
@@ -68,12 +70,11 @@ pub fn compress_sdp(sdp: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let compressed = raw_deflate(sdp.as_bytes(), Some(SDP_DICTIONARY.as_slice()))?;
+    let compressed = raw_deflate(sdp.as_bytes(), Some(SDP_DICTIONARY))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
     Ok(Some(encoded))
 }
 
-/// Raw inflate (windowBits=-15) with optional preset dictionary.
 fn raw_inflate(data: &[u8], dictionary: Option<&[u8]>) -> Result<String> {
     let mut decompress = Decompress::new(false); // false = raw deflate (no zlib header)
 
@@ -83,11 +84,13 @@ fn raw_inflate(data: &[u8], dictionary: Option<&[u8]>) -> Result<String> {
             .context("Failed to set inflate dictionary")?;
     }
 
-    // Start with 4x expansion estimate, grow if needed
-    let mut output = vec![0u8; data.len() * 4];
+    let initial_size = (data.len().saturating_mul(4)).clamp(1024, MAX_DECOMPRESSED_SDP_SIZE);
+    let mut output = vec![0u8; initial_size];
     let mut total_out = 0;
 
     loop {
+        let input_before = decompress.total_in();
+        let output_before = decompress.total_out();
         let status = decompress
             .decompress(
                 &data[decompress.total_in() as usize..],
@@ -101,9 +104,21 @@ fn raw_inflate(data: &[u8], dictionary: Option<&[u8]>) -> Result<String> {
         match status {
             Status::StreamEnd => break,
             Status::Ok | Status::BufError => {
-                // Need more output space
+                if decompress.total_in() == input_before && decompress.total_out() == output_before
+                {
+                    bail!("Raw inflate made no progress");
+                }
                 if output.len() - total_out < 1024 {
-                    output.resize(output.len() * 2, 0);
+                    if output.len() >= MAX_DECOMPRESSED_SDP_SIZE {
+                        bail!("Decompressed SDP exceeds the supported size");
+                    }
+                    output.resize(
+                        output
+                            .len()
+                            .saturating_mul(2)
+                            .min(MAX_DECOMPRESSED_SDP_SIZE),
+                        0,
+                    );
                 }
             }
         }
@@ -159,7 +174,6 @@ mod tests {
     fn test_plaintext_passthrough() {
         let sdp = "v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\ns=session\r\n";
         let result = decompress_sdp(sdp).unwrap();
-        // trim() strips trailing whitespace, so compare trimmed
         assert_eq!(result, sdp.trim());
     }
 
@@ -224,7 +238,6 @@ mod tests {
             a=label:main-audio\r\n\
             a=x-source:main-audio\r\n");
 
-        // Pad to exceed threshold
         for i in 0..30 {
             sdp.push_str(&format!(
                 "a=candidate:{} 1 UDP 100 10.0.{}.{} {} typ relay raddr 10.0.0.1 rport 21730\r\n",
@@ -270,13 +283,18 @@ mod tests {
         let without_dict = raw_deflate(sdp.as_bytes(), None).unwrap();
         let with_dict = raw_deflate(sdp.as_bytes(), Some(SDP_DICTIONARY)).unwrap();
 
-        // Dictionary should help (or at least not hurt)
         assert!(
             with_dict.len() <= without_dict.len(),
             "Dictionary should improve compression: {} vs {} bytes",
             with_dict.len(),
             without_dict.len()
         );
+    }
+
+    #[test]
+    fn test_empty_blob_returns_error() {
+        assert!(decompress_sdp("").is_err());
+        assert!(decompress_sdp("   ").is_err());
     }
 
     #[test]

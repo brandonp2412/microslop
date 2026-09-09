@@ -1,178 +1,14 @@
-//! Minimal SDP answer generator for audio-only calls.
+//! SDP parsing and offer/answer generation for Teams audio and H.264 video calls.
 //!
-//! Parses enough of the incoming SDP offer to extract ICE credentials and
-//! crypto keys, then generates a minimal SDP answer with PCMU codec.
+//! Extracts ICE/SRTP media parameters and generates the constrained codec/media
+//! descriptions implemented by Microslop.
 
-use anyhow::Result;
 use base64::Engine;
 
-/// Extracted fields from the incoming SDP offer.
-#[derive(Debug, Clone)]
-pub struct SdpOfferInfo {
-    pub ice_ufrag: String,
-    pub ice_pwd: String,
-    /// First crypto line from the offer (we echo it back).
-    pub crypto_line: String,
-    /// All crypto lines from the offer (for SRTP key extraction).
-    pub crypto_lines: Vec<String>,
-    /// First candidate address and port from the offer.
-    pub candidate_ip: String,
-    pub candidate_port: u16,
-    /// Video section info (if present in the offer).
-    pub video: Option<SdpVideoInfo>,
-}
+mod parse;
 
-/// Extracted video-specific fields from the SDP offer.
-#[derive(Debug, Clone)]
-pub struct SdpVideoInfo {
-    pub ice_ufrag: String,
-    pub ice_pwd: String,
-    pub crypto_lines: Vec<String>,
-    pub candidate_ip: String,
-    pub candidate_port: u16,
-}
-
-/// Parse the SDP offer blob to extract ICE credentials, crypto, and candidates.
-///
-/// The blob may be compressed (auf::compress with raw DEFLATE + base64 encoding).
-/// This function automatically decompresses if needed via `sdp_compress::decompress_sdp`.
-pub fn parse_sdp_offer(blob: &str) -> Result<SdpOfferInfo> {
-    let blob = super::sdp_compress::decompress_sdp(blob).unwrap_or_else(|_| blob.to_string());
-    let mut ice_ufrag = String::new();
-    let mut ice_pwd = String::new();
-    let mut crypto_line = String::new();
-    let mut crypto_lines = Vec::new();
-    let mut candidate_ip = String::new();
-    let mut candidate_port: u16 = 0;
-
-    // Video section fields
-    let mut vid_ice_ufrag = String::new();
-    let mut vid_ice_pwd = String::new();
-    let mut vid_crypto_lines = Vec::new();
-    let mut vid_candidate_ip = String::new();
-    let mut vid_candidate_port: u16 = 0;
-    let mut has_video = false;
-
-    #[derive(PartialEq)]
-    enum Section {
-        Session,
-        Audio,
-        Video,
-        Other,
-    }
-    let mut section = Section::Session;
-
-    for line in blob.lines() {
-        let line = line.trim();
-
-        if line.starts_with("m=audio") {
-            section = Section::Audio;
-        } else if line.starts_with("m=video") {
-            section = Section::Video;
-            has_video = true;
-        } else if line.starts_with("m=") {
-            section = Section::Other;
-        }
-
-        // ICE credentials
-        if line.starts_with("a=ice-ufrag:") {
-            let val = line.trim_start_matches("a=ice-ufrag:").to_string();
-            match section {
-                Section::Audio => ice_ufrag = val,
-                Section::Video => vid_ice_ufrag = val,
-                Section::Session if ice_ufrag.is_empty() => ice_ufrag = val,
-                _ => {}
-            }
-        }
-        if line.starts_with("a=ice-pwd:") {
-            let val = line.trim_start_matches("a=ice-pwd:").to_string();
-            match section {
-                Section::Audio => ice_pwd = val,
-                Section::Video => vid_ice_pwd = val,
-                Section::Session if ice_pwd.is_empty() => ice_pwd = val,
-                _ => {}
-            }
-        }
-
-        // Crypto lines
-        if line.starts_with("a=crypto:") || line.starts_with("a=cryptoscale:") {
-            if crypto_line.is_empty() {
-                crypto_line = line.to_string();
-            }
-            match section {
-                Section::Audio => crypto_lines.push(line.to_string()),
-                Section::Video => vid_crypto_lines.push(line.to_string()),
-                _ => {}
-            }
-        }
-
-        // Candidates
-        if line.starts_with("a=candidate:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
-                let ip = parts[4].to_string();
-                let port: u16 = parts[5].parse().unwrap_or(0);
-                match section {
-                    Section::Audio if candidate_ip.is_empty() => {
-                        candidate_ip = ip;
-                        candidate_port = port;
-                    }
-                    Section::Video if vid_candidate_ip.is_empty() => {
-                        vid_candidate_ip = ip;
-                        vid_candidate_port = port;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    if ice_ufrag.is_empty() {
-        anyhow::bail!("Could not extract ice-ufrag from SDP offer");
-    }
-
-    let video = if has_video {
-        Some(SdpVideoInfo {
-            ice_ufrag: if vid_ice_ufrag.is_empty() {
-                ice_ufrag.clone()
-            } else {
-                vid_ice_ufrag
-            },
-            ice_pwd: if vid_ice_pwd.is_empty() {
-                ice_pwd.clone()
-            } else {
-                vid_ice_pwd
-            },
-            crypto_lines: if vid_crypto_lines.is_empty() {
-                crypto_lines.clone()
-            } else {
-                vid_crypto_lines
-            },
-            candidate_ip: if vid_candidate_ip.is_empty() {
-                candidate_ip.clone()
-            } else {
-                vid_candidate_ip
-            },
-            candidate_port: if vid_candidate_port == 0 {
-                candidate_port
-            } else {
-                vid_candidate_port
-            },
-        })
-    } else {
-        None
-    };
-
-    Ok(SdpOfferInfo {
-        ice_ufrag,
-        ice_pwd,
-        crypto_line,
-        crypto_lines,
-        candidate_ip,
-        candidate_port,
-        video,
-    })
-}
+pub(crate) use parse::main_video_section;
+pub use parse::{parse_sdp_offer, SdpOfferInfo, SdpVideoInfo};
 
 /// Generate a minimal SDP answer for audio-only with PCMU codec.
 ///
@@ -187,7 +23,7 @@ pub fn generate_sdp_answer(local_ip: &str, offer: &SdpOfferInfo) -> String {
 pub fn generate_sdp_answer_with_port(
     local_ip: &str,
     local_port: u16,
-    offer: &SdpOfferInfo,
+    _offer: &SdpOfferInfo,
 ) -> String {
     let our_ufrag = generate_ice_ufrag();
     let our_pwd = generate_ice_pwd();
@@ -196,7 +32,6 @@ pub fn generate_sdp_answer_with_port(
 
     let mut sdp = String::new();
 
-    // Session level
     sdp.push_str("v=0\r\n");
     sdp.push_str(&format!("o=- 0 0 IN IP4 {}\r\n", local_ip));
     sdp.push_str("s=session\r\n");
@@ -215,7 +50,6 @@ pub fn generate_sdp_answer_with_port(
     sdp.push_str(&format!("a=ice-ufrag:{}\r\n", our_ufrag));
     sdp.push_str(&format!("a=ice-pwd:{}\r\n", our_pwd));
 
-    // Host candidate
     sdp.push_str(&format!(
         "a=candidate:1 1 UDP 2130706431 {} {} typ host\r\n",
         local_ip, port
@@ -236,7 +70,7 @@ pub fn generate_sdp_answer_with_port(
 pub fn generate_sdp_answer_with_crypto(
     local_ip: &str,
     local_port: u16,
-    offer: &SdpOfferInfo,
+    _offer: &SdpOfferInfo,
 ) -> (String, String) {
     let our_ufrag = generate_ice_ufrag();
     let our_pwd = generate_ice_pwd();
@@ -365,11 +199,9 @@ pub fn generate_sdp_answer_with_video(
             vid_crypto_key
         );
 
-        sdp.push_str(&format!("m=video {} RTP/SAVP 122 121 123\r\n", video_port));
+        sdp.push_str(&format!("m=video {} RTP/SAVP 122\r\n", video_port));
         sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
         sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
-        sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
-        sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
         sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
         sdp.push_str("a=rtcp-rsize\r\n");
         sdp.push_str("a=sendrecv\r\n");
@@ -433,8 +265,9 @@ pub fn generate_sdp_answer_full(
     sdp.push_str(&format!("c=IN IP4 {}\r\n", local_ip));
     sdp.push_str("t=0 0\r\n");
 
-    if offer.video.is_some() {
-        sdp.push_str("a=x-mediabw:main-video send=2000;recv=2000\r\n");
+    let video_active = offer.video.is_some() && video_port != 0;
+    if video_active {
+        sdp.push_str("a=x-mediabw:main-video send=0;recv=2000\r\n");
     }
 
     // Audio section
@@ -448,7 +281,6 @@ pub fn generate_sdp_answer_full(
     sdp.push_str(&format!("a=ice-ufrag:{}\r\n", our_ufrag));
     sdp.push_str(&format!("a=ice-pwd:{}\r\n", our_pwd));
 
-    // Include gathered candidates
     if local_candidates.is_empty() {
         // Fallback: single host candidate
         sdp.push_str(&format!(
@@ -465,7 +297,7 @@ pub fn generate_sdp_answer_full(
     sdp.push_str("\r\n");
 
     // Video section
-    let (video_crypto_line, video_ice_ufrag, video_ice_pwd) = if offer.video.is_some() {
+    let (video_crypto_line, video_ice_ufrag, video_ice_pwd) = if video_active {
         let vid_ufrag = generate_ice_ufrag();
         let vid_pwd = generate_ice_pwd();
         let vid_crypto_key = generate_srtp_key();
@@ -474,14 +306,12 @@ pub fn generate_sdp_answer_full(
             vid_crypto_key
         );
 
-        sdp.push_str(&format!("m=video {} RTP/SAVP 122 121 123\r\n", video_port));
+        sdp.push_str(&format!("m=video {} RTP/SAVP 122\r\n", video_port));
         sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
         sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
-        sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
-        sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
         sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
         sdp.push_str("a=rtcp-rsize\r\n");
-        sdp.push_str("a=sendrecv\r\n");
+        sdp.push_str("a=recvonly\r\n");
         sdp.push_str("a=rtcp-mux\r\n");
         sdp.push_str("a=label:main-video\r\n");
         sdp.push_str("a=x-source:main-video\r\n");
@@ -504,6 +334,12 @@ pub fn generate_sdp_answer_full(
 
         (Some(vid_crypto), Some(vid_ufrag), Some(vid_pwd))
     } else {
+        if offer.video.is_some() {
+            sdp.push_str("m=video 0 RTP/SAVP 122\r\n");
+            sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
+            sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
+            sdp.push_str("a=inactive\r\n");
+        }
         (None, None, None)
     };
 
@@ -594,6 +430,7 @@ pub struct AvSdpResult {
 /// Parameters for audio+video SDP generation.
 pub struct AvSdpParams<'a> {
     pub local_ip: &'a str,
+    pub include_video: bool,
     pub audio_port: u16,
     pub video_port: u16,
     pub audio_ufrag: &'a str,
@@ -625,14 +462,17 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
     );
     let mut sdp = String::new();
 
-    // Session level
     sdp.push_str("v=0\r\n");
     sdp.push_str(&format!("o=- 0 0 IN IP4 {}\r\n", p.local_ip));
     sdp.push_str("s=session\r\n");
     sdp.push_str(&format!("c=IN IP4 {}\r\n", p.local_ip));
-    sdp.push_str("b=CT:99980\r\n");
+    if p.include_video {
+        sdp.push_str("b=CT:99980\r\n");
+    }
     sdp.push_str("t=0 0\r\n");
-    sdp.push_str("a=x-mediabw:main-video send=12000;recv=12000\r\n");
+    if p.include_video {
+        sdp.push_str("a=x-mediabw:main-video send=12000;recv=12000\r\n");
+    }
 
     // Audio m-line
     sdp.push_str(&format!("m=audio {} RTP/SAVP 0\r\n", p.audio_port));
@@ -666,45 +506,39 @@ pub fn generate_av_sdp_offer(p: &AvSdpParams) -> AvSdpResult {
     sdp.push_str(&audio_crypto_line);
     sdp.push_str("\r\n");
 
-    // Video m-line — X-H264UC (Teams proprietary H.264 SVC variant)
-    sdp.push_str(&format!(
-        "m=video {} RTP/SAVP 122 121 123\r\n",
-        p.video_port
-    ));
-    sdp.push_str("a=mid:1\r\n");
-    sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
-    sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
-    sdp.push_str("a=rtpmap:121 x-rtvc1/90000\r\n");
-    sdp.push_str("a=rtpmap:123 x-ulpfecuc/90000\r\n");
-    sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
-    sdp.push_str("a=rtcp-rsize\r\n");
-    sdp.push_str(&format!(
-        "a=x-ssrc-range:{}-{}\r\n",
-        p.video_ssrc_base,
-        p.video_ssrc_base
-            .saturating_add(super::video::VIDEO_SSRC_RANGE_SIZE - 1)
-    ));
-    sdp.push_str("a=x-caps:121 263:320:240:15.0:250000:1;4359:176:144:15.0:100000:1\r\n");
-    sdp.push_str("a=sendrecv\r\n");
-    sdp.push_str("a=rtcp-mux\r\n");
-    sdp.push_str("a=label:main-video\r\n");
-    sdp.push_str("a=x-source:main-video\r\n");
-    sdp.push_str(&format!("a=ice-ufrag:{}\r\n", p.video_ufrag));
-    sdp.push_str(&format!("a=ice-pwd:{}\r\n", p.video_pwd));
-
-    if p.video_candidates.is_empty() {
+    if p.include_video {
+        sdp.push_str(&format!("m=video {} RTP/SAVP 122\r\n", p.video_port));
+        sdp.push_str("a=mid:1\r\n");
+        sdp.push_str("a=rtpmap:122 X-H264UC/90000\r\n");
+        sdp.push_str("a=fmtp:122 packetization-mode=1;mst-mode=NI-TC\r\n");
+        sdp.push_str("a=rtcp-fb:* x-message app send:src,x-pli recv:src,x-pli\r\n");
+        sdp.push_str("a=rtcp-rsize\r\n");
         sdp.push_str(&format!(
-            "a=candidate:1 1 UDP 2130706431 {} {} typ host\r\n",
-            p.local_ip, p.video_port
+            "a=x-ssrc-range:{}-{}\r\n",
+            p.video_ssrc_base,
+            p.video_ssrc_base
+                .saturating_add(super::video::VIDEO_SSRC_RANGE_SIZE - 1)
         ));
-    } else {
-        for c in p.video_candidates {
-            sdp.push_str(&format!("a={}\r\n", c.to_sdp_line()));
-        }
-    }
+        sdp.push_str("a=sendrecv\r\n");
+        sdp.push_str("a=rtcp-mux\r\n");
+        sdp.push_str("a=label:main-video\r\n");
+        sdp.push_str("a=x-source:main-video\r\n");
+        sdp.push_str(&format!("a=ice-ufrag:{}\r\n", p.video_ufrag));
+        sdp.push_str(&format!("a=ice-pwd:{}\r\n", p.video_pwd));
 
-    sdp.push_str(&video_crypto_line);
-    sdp.push_str("\r\n");
+        if p.video_candidates.is_empty() {
+            sdp.push_str(&format!(
+                "a=candidate:1 1 UDP 2130706431 {} {} typ host\r\n",
+                p.local_ip, p.video_port
+            ));
+        } else {
+            for c in p.video_candidates {
+                sdp.push_str(&format!("a={}\r\n", c.to_sdp_line()));
+            }
+        }
+        sdp.push_str(&video_crypto_line);
+        sdp.push_str("\r\n");
+    }
 
     AvSdpResult {
         sdp,
@@ -737,6 +571,7 @@ pub fn generate_av_sdp_answer(
 
     generate_av_sdp_offer(&AvSdpParams {
         local_ip,
+        include_video: true,
         audio_port,
         video_port,
         audio_ufrag: &audio_ufrag,
@@ -753,7 +588,6 @@ pub fn generate_av_sdp_answer(
 /// Get the local IP address (best effort — falls back to 127.0.0.1).
 pub fn get_local_ip() -> String {
     // Try to determine local IP by connecting a UDP socket to a public address.
-    // This doesn't send any data, just lets the OS pick the outbound interface.
     if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
             if let Ok(addr) = socket.local_addr() {
@@ -812,9 +646,70 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[test]
+    fn test_generate_sdp_answer_full_accepts_video_receive_only() {
+        let offer = parse_sdp_offer(
+            &generate_av_sdp_offer(&AvSdpParams {
+                local_ip: "10.0.0.5",
+                include_video: true,
+                audio_port: 40000,
+                video_port: 40002,
+                audio_ufrag: "aUfr",
+                audio_pwd: "aPwd1234567890123456",
+                video_ufrag: "vUfr",
+                video_pwd: "vPwd1234567890123456",
+                audio_candidates: &[],
+                video_candidates: &[],
+                video_ssrc_base: 5000,
+                audio_ssrc: 9999,
+            })
+            .sdp,
+        )
+        .unwrap();
+        let answer = generate_sdp_answer_full("10.0.0.10", 41000, 41002, &offer, &[], &[]);
+
+        assert!(answer.sdp.contains("m=video 41002 RTP/SAVP 122\r\n"));
+        assert!(answer.sdp.contains("a=recvonly\r\n"));
+        assert!(!answer.sdp.contains("x-rtvc1"));
+        assert!(!answer.sdp.contains("x-ulpfecuc"));
+        assert!(answer.video_crypto_line.is_some());
+        assert!(answer.video_ice_ufrag.is_some());
+        assert!(answer.video_ice_pwd.is_some());
+    }
+
+    #[test]
+    fn test_generate_sdp_answer_full_rejects_video_without_port() {
+        let offer = parse_sdp_offer(
+            &generate_av_sdp_offer(&AvSdpParams {
+                local_ip: "10.0.0.5",
+                include_video: true,
+                audio_port: 40000,
+                video_port: 40002,
+                audio_ufrag: "aUfr",
+                audio_pwd: "aPwd1234567890123456",
+                video_ufrag: "vUfr",
+                video_pwd: "vPwd1234567890123456",
+                audio_candidates: &[],
+                video_candidates: &[],
+                video_ssrc_base: 5000,
+                audio_ssrc: 9999,
+            })
+            .sdp,
+        )
+        .unwrap();
+        let answer = generate_sdp_answer_full("10.0.0.10", 41000, 0, &offer, &[], &[]);
+
+        assert!(answer.sdp.contains("m=video 0 RTP/SAVP 122\r\n"));
+        assert!(answer.sdp.contains("a=inactive\r\n"));
+        assert!(answer.video_crypto_line.is_none());
+        assert!(answer.video_ice_ufrag.is_none());
+        assert!(answer.video_ice_pwd.is_none());
+    }
+
+    #[test]
     fn test_generate_av_sdp_offer() {
         let result = generate_av_sdp_offer(&AvSdpParams {
             local_ip: "192.168.1.100",
+            include_video: true,
             audio_port: 20000,
             video_port: 20002,
             audio_ufrag: "auFr",
@@ -829,21 +724,21 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         let sdp = &result.sdp;
 
-        // Both m-lines present
         assert!(
             sdp.contains("m=audio 20000 RTP/SAVP 0"),
             "missing audio m-line"
         );
         assert!(
-            sdp.contains("m=video 20002 RTP/SAVP 122 121 123"),
+            sdp.contains("m=video 20002 RTP/SAVP 122"),
             "missing video m-line"
         );
 
-        // Session-level attributes
         assert!(sdp.contains("b=CT:99980"), "missing b=CT:99980");
         assert!(
-            sdp.contains("a=x-mediabw:main-video send=12000;recv=12000"),
-            "missing mediabw"
+            sdp.starts_with(
+                "v=0\r\no=- 0 0 IN IP4 192.168.1.100\r\ns=session\r\nc=IN IP4 192.168.1.100\r\nb=CT:99980\r\nt=0 0\r\na=x-mediabw:main-video send=12000;recv=12000\r\n"
+            ),
+            "invalid Teams session-level SDP field order: {sdp}"
         );
 
         // Audio attributes
@@ -871,9 +766,19 @@ a=rtpmap:8 PCMA/8000\r\n";
             sdp.contains("a=x-ssrc-range:1000-1099"),
             "missing video x-ssrc-range"
         );
-        assert!(sdp.contains("a=x-caps:121"), "missing x-caps for PT 121");
+        assert!(
+            !sdp.contains("x-rtvc1"),
+            "must not advertise unsupported RTVideo"
+        );
+        assert!(
+            !sdp.contains("x-ulpfecuc"),
+            "must not advertise unsupported ULPFEC-UC"
+        );
+        assert!(
+            !sdp.contains("a=x-caps:"),
+            "must not advertise RTVideo caps"
+        );
 
-        // MID attributes
         let audio_idx = sdp.find("m=audio").unwrap();
         let video_idx = sdp.find("m=video").unwrap();
         let audio_section = &sdp[audio_idx..video_idx];
@@ -909,7 +814,6 @@ a=rtpmap:8 PCMA/8000\r\n";
             "video crypto not in video section"
         );
 
-        // rtcp-mux on both
         assert!(
             audio_section.contains("a=rtcp-mux"),
             "audio missing rtcp-mux"
@@ -919,16 +823,35 @@ a=rtpmap:8 PCMA/8000\r\n";
             "video missing rtcp-mux"
         );
 
-        // Labels
         assert!(audio_section.contains("a=label:main-audio"));
         assert!(video_section.contains("a=label:main-video"));
 
-        // Session-level bandwidth hint
         assert!(sdp.contains("a=x-mediabw:main-video send=12000;recv=12000"));
 
-        // Result struct fields
         assert_eq!(result.audio_ufrag, "auFr");
         assert_eq!(result.video_ufrag, "viFr");
+    }
+
+    #[test]
+    fn test_generate_av_sdp_offer_without_video_omits_video_media() {
+        let result = generate_av_sdp_offer(&AvSdpParams {
+            local_ip: "192.168.1.100",
+            include_video: false,
+            audio_port: 20000,
+            video_port: 20002,
+            audio_ufrag: "auFr",
+            audio_pwd: "audioPassword123456789==",
+            video_ufrag: "viFr",
+            video_pwd: "videoPassword123456789==",
+            audio_candidates: &[],
+            video_candidates: &[],
+            video_ssrc_base: 1000,
+            audio_ssrc: 5555,
+        });
+
+        assert!(result.sdp.contains("m=audio 20000 RTP/SAVP 0"));
+        assert!(!result.sdp.contains("m=video"));
+        assert!(!result.sdp.contains("main-video"));
     }
 
     #[test]
@@ -958,9 +881,34 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[test]
+    fn test_parse_sdp_uses_lowercase_h264uc_video_fallback() {
+        let sdp = "v=0\r\nm=audio 30000 RTP/SAVP 0\r\na=ice-ufrag:audio\r\na=ice-pwd:audio-password\r\nm=video 31000 RTP/SAVP 107\r\na=ice-ufrag:other\r\na=ice-pwd:other-password\r\na=rtpmap:107 H264/90000\r\nm=video 32000 RTP/SAVP 122\r\na=ice-ufrag:h264uc\r\na=ice-pwd:h264uc-password\r\na=rtpmap:122 x-h264uc/90000\r\n";
+
+        let parsed = parse_sdp_offer(sdp).unwrap();
+        let video = parsed.video.unwrap();
+        assert_eq!(video.ice_ufrag, "h264uc");
+        assert_eq!(video.ice_pwd, "h264uc-password");
+    }
+
+    #[test]
+    fn test_parse_sdp_uses_main_video_section_only() {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\ns=session\r\nt=0 0\r\nm=audio 30000 RTP/SAVP 0\r\na=ice-ufrag:audio\r\na=ice-pwd:audio-password\r\na=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:audio-key\r\na=candidate:1 1 UDP 100 10.0.0.1 30000 typ host\r\nm=video 31000 RTP/SAVP 122\r\na=label:applicationsharing-video\r\na=rtpmap:122 X-H264UC/90000\r\na=ice-ufrag:sharing\r\na=ice-pwd:sharing-password\r\na=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:sharing-key\r\na=candidate:2 1 UDP 100 10.0.0.2 31000 typ host\r\nm=video 32000 RTP/SAVP 122\r\na=label:main-video\r\na=rtpmap:122 X-H264UC/90000\r\na=ice-ufrag:main\r\na=ice-pwd:main-password\r\na=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:main-key\r\na=candidate:3 1 UDP 100 10.0.0.3 32000 typ host\r\n";
+
+        let parsed = parse_sdp_offer(sdp).unwrap();
+        let video = parsed.video.unwrap();
+        assert_eq!(video.ice_ufrag, "main");
+        assert_eq!(video.ice_pwd, "main-password");
+        assert_eq!(video.candidate_ip, "10.0.0.3");
+        assert_eq!(video.candidate_port, 32000);
+        assert_eq!(video.crypto_lines.len(), 1);
+        assert!(video.crypto_lines[0].contains("main-key"));
+    }
+
+    #[test]
     fn test_parse_av_sdp_roundtrip() {
         let offer = generate_av_sdp_offer(&AvSdpParams {
             local_ip: "10.0.0.5",
+            include_video: true,
             audio_port: 40000,
             video_port: 40002,
             audio_ufrag: "aUfr",

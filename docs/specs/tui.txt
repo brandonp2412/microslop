@@ -7,7 +7,7 @@
 ╠══════════════════╬═══════════════════════════════════════════════════════════════════╣
 ║                  ║                                                                   ║
 ║  ▼ Engineering   ║  ┌─────────────────────────────────────────────────────────────┐  ║
-║    # general  3  ║  │ 👤 Sarah Chen                                9:15 AM today │  ║
+║    # general  3  ║  │ 👤 Test User                                9:15 AM today │  ║
 ║    # dev         ║  │                                                             │  ║
 ║    # announce    ║  │ Hey team! Just pushed the new authentication module to     │  ║
 ║                  ║  │ staging. Can someone help review? @Alex @Jordan            │  ║
@@ -22,7 +22,7 @@
 ║                  ║       │ when the token expires mid-session?                  │    ║
 ║  👤 Dave      •  ║       └──────────────────────────────────────────────────────┘    ║
 ║  👤 Eve       2  ║     ↳ ┌──────────────────────────────────────────────────────┐    ║
-║  👤 Frank        ║       │ 👤 Sarah Chen                            9:25 AM   │    ║
+║  👤 Frank        ║       │ 👤 Test User                            9:25 AM   │    ║
 ║  👥 Project X    ║       │ Good catch! Added refresh handler. See a3f2d1       │    ║
 ║                  ║       └──────────────────────────────────────────────────────┘    ║
 ║                  ║                                                              ↓[+] ║

@@ -22,10 +22,6 @@ Visual diagrams of the Teams CLI architecture and protocols.
 
 ![Teams Channels](arch/teams-channels.drawio.svg)
 
-### Presence
-
-![Presence](arch/presence.drawio.svg)
-
 ## Real-time Notifications (Trouter)
 
 ### Trouter Overview

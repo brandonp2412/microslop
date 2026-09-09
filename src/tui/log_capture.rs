@@ -10,34 +10,28 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 
-/// Ring buffer capacity for log lines.
 ///
 /// This is the backpressure limit on the write path. The display side
 /// (`DebugLogState`) accumulates up to a larger limit (1000) for scroll history.
 const RING_BUFFER_CAPACITY: usize = 500;
 
-/// A thread-safe ring buffer for log lines.
 ///
 /// Clone is derived to satisfy the `MakeWriter` trait which requires creating
-/// new writers that share the underlying buffer.
 #[derive(Clone)]
 pub struct LogBuffer {
     inner: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl LogBuffer {
-    /// Create a new empty log buffer.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(RING_BUFFER_CAPACITY))),
         }
     }
 
-    /// Push a log line into the buffer.
     ///
     /// If the buffer is at capacity, the oldest line is removed.
     /// If the mutex is poisoned (another thread panicked), we recover the
-    /// inner data and continue - logging should not cascade failures.
     pub fn push(&self, line: String) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() >= RING_BUFFER_CAPACITY {
@@ -46,11 +40,9 @@ impl LogBuffer {
         guard.push_back(line);
     }
 
-    /// Drain all accumulated lines from the buffer.
     ///
     /// Returns the lines in order (oldest first) and clears the buffer.
     /// This is designed for single-consumer use; if multiple consumers call
-    /// drain(), they will compete for lines.
     pub fn drain(&self) -> Vec<String> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.drain(..).collect()
@@ -78,13 +70,13 @@ impl BufferWriter {
     }
 
     fn flush_lines(&mut self) {
-        // Flush all complete lines (ending in \n) from pending.
-        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=pos).collect();
-            // Convert to string, stripping the trailing newline.
-            let s = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-            self.buffer.push(s);
+        let Some(last_newline) = self.pending.iter().rposition(|&b| b == b'\n') else {
+            return;
+        };
+        for line in self.pending[..last_newline].split(|&b| b == b'\n') {
+            self.buffer.push(String::from_utf8_lossy(line).into_owned());
         }
+        self.pending.drain(..=last_newline);
     }
 }
 
@@ -96,7 +88,6 @@ impl Write for BufferWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // Flush any remaining partial line on explicit flush.
         if !self.pending.is_empty() {
             let s = String::from_utf8_lossy(&self.pending).into_owned();
             self.buffer.push(s);
@@ -108,7 +99,6 @@ impl Write for BufferWriter {
 
 impl Drop for BufferWriter {
     fn drop(&mut self) {
-        // Flush any remaining partial line.
         let _ = Write::flush(self);
     }
 }
@@ -135,7 +125,6 @@ mod tests {
         let lines = buf.drain();
         assert_eq!(lines, vec!["line 1", "line 2"]);
 
-        // Drain again should be empty.
         assert!(buf.drain().is_empty());
     }
 
@@ -147,7 +136,6 @@ mod tests {
         }
 
         let lines = buf.drain();
-        // Should have dropped the first 100 lines.
         assert_eq!(lines.len(), 500);
         assert_eq!(lines[0], "line 100");
         assert_eq!(lines[499], "line 599");
@@ -169,10 +157,8 @@ mod tests {
         let buf = LogBuffer::new();
         {
             let mut writer = BufferWriter::new(buf.clone());
-            write!(writer, "partial").unwrap();
-            // No newline yet, so nothing in buffer.
-            assert!(buf.drain().is_empty());
-            // Drop flushes the partial line.
+            write!(writer, "one\n\npartial").unwrap();
+            assert_eq!(buf.drain(), vec!["one", ""]);
         }
 
         let lines = buf.drain();

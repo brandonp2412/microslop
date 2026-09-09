@@ -18,10 +18,8 @@ use super::search;
 use super::sidebar;
 
 /// Percentage of main area height allocated to content when debug log is visible.
-/// The remainder goes to the debug log pane.
 const DEBUG_LOG_CONTENT_PERCENT: u16 = 70;
 
-/// Returns status indicator symbol and color based on online state
 fn status_indicator(is_online: bool) -> (&'static str, Color) {
     if is_online {
         ("*", Color::Green)
@@ -30,11 +28,9 @@ fn status_indicator(is_online: bool) -> (&'static str, Color) {
     }
 }
 
-/// Main render function
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Layout: header (1 line) + main content + status bar (1 line)
     let [header_area, main_area, status_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -42,10 +38,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     ])
     .areas(area);
 
-    // Render header bar
     render_header(header_area, frame.buffer_mut(), app);
 
-    // If debug log is visible, split main area vertically: content + debug log
     let (content_main_area, debug_log_area) = if app.debug_log.visible {
         let [content, debug] = Layout::vertical([
             Constraint::Percentage(DEBUG_LOG_CONTENT_PERCENT),
@@ -57,11 +51,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         (main_area, None)
     };
 
-    // Split content_main_area: sidebar (22 cols) + content
     let [sidebar_area, content_area] =
         Layout::horizontal([Constraint::Length(22), Constraint::Fill(1)]).areas(content_main_area);
 
-    // Render sidebar
     sidebar::render(
         sidebar_area,
         frame.buffer_mut(),
@@ -69,14 +61,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.active_pane == Pane::Sidebar,
     );
 
-    // Split content area: messages (fill) + compose box (4 lines)
     let [messages_area, compose_area] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(compose::COMPOSE_HEIGHT),
     ])
     .areas(content_area);
 
-    // Render messages pane
     messages::render(
         messages_area,
         frame.buffer_mut(),
@@ -85,7 +75,6 @@ pub fn render(frame: &mut Frame, app: &App) {
         &app.user_name,
     );
 
-    // Render compose box
     compose::render(
         compose_area,
         frame,
@@ -94,26 +83,21 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.active_pane == Pane::Compose,
     );
 
-    // Render debug log pane if visible
     if let Some(debug_area) = debug_log_area {
         debug_log::render(debug_area, frame.buffer_mut(), &app.debug_log);
     }
 
-    // Render status bar
     render_status(status_area, frame.buffer_mut(), app);
 
-    // Render search overlay (on top of main content, below help popup)
     if app.search.active {
         search::render_search_overlay(frame, &app.search);
     }
 
-    // Render help popup overlay (on top of everything else)
     if app.show_help {
         help::render_help_popup(frame);
     }
 }
 
-/// Render the header bar
 fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     let title_text = " OST Client ";
     let title = Span::styled(
@@ -141,7 +125,6 @@ fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         Style::default().fg(Color::Cyan),
     );
 
-    // Calculate spacing to right-align the right-side elements
     let left_width = title_text.len();
     let right_content = format!(
         "[?] Help  {} {}  {} ",
@@ -164,9 +147,7 @@ fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     header.render(area, buf);
 }
 
-/// Render the status bar
 fn render_status(area: Rect, buf: &mut Buffer, app: &App) {
-    // If there's a status message, show it prominently.
     if let Some(ref msg) = app.status_message {
         let style = if app.status_is_error {
             Style::default().fg(Color::Red).bg(Color::DarkGray)

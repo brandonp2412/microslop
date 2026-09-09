@@ -1,21 +1,89 @@
 //! Outgoing call test — places a call to the av-test channel via two-phase
 //! conversation API (epconv + conversationController).
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::auth::TokenStore;
+#[cfg(any(feature = "video-capture", feature = "video-capture-windows"))]
+use crate::calling::camera;
+#[cfg(feature = "video-codec")]
+use crate::calling::codec;
 #[cfg(feature = "video-capture")]
-use crate::calling::{camera, codec, display};
+use crate::calling::display;
+#[cfg(all(feature = "video-codec", target_os = "android"))]
+use crate::calling::external_camera;
 use crate::calling::{ice, recording, rtcp, rtp, sdp, signaling, srtp, test_tone, video};
 use crate::config::Config;
 use crate::trouter::{registrar, session, websocket};
 
-/// Result of a call test.
+mod acceptance;
+mod media;
+mod support;
+
+pub use acceptance::extract_call_payload;
+use acceptance::{
+    await_with_call_signaling, end_call_by_url, extract_callee_oid_from_thread,
+    extract_mri_from_skype_token, wait_for_call_acceptance, wait_for_call_end,
+};
+use media::{
+    setup_media_leg, spawn_media_leg, update_video_transport, MediaLegSetup, MediaLegSpawn,
+};
+use support::{derive_epconv_url, fetch_me, CallAcceptanceResponse, MediaLeg, MediaLegHandles};
+
+#[cfg(test)]
+mod tests {
+    use super::{callee_mri_for_thread, caller_id_for_mri, media::next_audio_frame};
+
+    #[test]
+    fn microphone_callback_batches_preserve_every_audio_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![1]).unwrap();
+        tx.send(vec![2]).unwrap();
+
+        assert_eq!(next_audio_frame(&rx), Some(vec![1]));
+        assert_eq!(next_audio_frame(&rx), Some(vec![2]));
+        assert_eq!(next_audio_frame(&rx), None);
+    }
+
+    #[test]
+    fn thread_peer_identity_wins_over_stale_cached_identity() {
+        assert_eq!(
+            callee_mri_for_thread(
+                "19:caller_thread-peer@unq.gbl.spaces",
+                "caller",
+                Some("stale-peer"),
+            ),
+            Some("8:orgid:thread-peer".to_owned()),
+        );
+    }
+
+    #[test]
+    fn caller_identity_supports_work_and_personal_accounts() {
+        assert_eq!(caller_id_for_mri("8:orgid:abc"), Some("abc"));
+        assert_eq!(caller_id_for_mri("8:live:testuser"), Some("live:testuser"));
+    }
+
+    #[test]
+    fn cached_identity_is_used_when_thread_does_not_identify_the_caller() {
+        assert_eq!(
+            callee_mri_for_thread(
+                "19:other-one_other-two@unq.gbl.spaces",
+                "caller",
+                Some("real-peer"),
+            ),
+            Some("8:orgid:real-peer".to_owned()),
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct CallTestResult {
     pub call_placed: bool,
@@ -23,8 +91,42 @@ pub struct CallTestResult {
     pub rejection_reason: Option<String>,
     pub packets_sent: u32,
     pub packets_received: u32,
+    pub raw_audio_datagrams: u32,
+    pub audio_stun_datagrams: u32,
+    pub audio_srtp_decrypt_failures: u32,
+    pub audio_initial_remote_addr: Option<std::net::SocketAddr>,
+    pub audio_final_remote_addr: Option<std::net::SocketAddr>,
+    pub audio_first_rtp_source: Option<std::net::SocketAddr>,
+    pub microphone_frames: u32,
+    pub microphone_non_silent_frames: u32,
+    pub microphone_peak: u32,
+    pub microphone_frames_produced: u32,
+    pub microphone_frames_enqueued: u32,
+    pub microphone_frames_dropped: u32,
+    pub microphone_receiver_disconnects: u32,
+    pub microphone_stream_errors: u32,
+    pub speaker_frames_received: u32,
+    pub speaker_samples_rendered: u32,
+    pub speaker_stream_errors: u32,
     pub video_packets_sent: u32,
     pub video_packets_received: u32,
+    pub raw_video_datagrams: u32,
+    pub video_stun_datagrams: u32,
+    pub video_srtcp_datagrams: u32,
+    pub video_srtp_decrypt_failures: u32,
+    pub video_vsr_requests_sent: u32,
+    pub video_keyframe_requests_received: u32,
+    pub video_receiver_reports_for_local_ssrc: u32,
+    pub video_rr_fraction_lost: u32,
+    pub video_rr_cumulative_lost: i32,
+    pub video_rr_extended_highest_seq: u32,
+    pub video_rr_jitter: u32,
+    pub video_first_sequence_sent: u32,
+    pub video_last_sequence_sent: u32,
+    pub video_initial_remote_addr: Option<std::net::SocketAddr>,
+    pub video_final_remote_addr: Option<std::net::SocketAddr>,
+    pub video_first_rtp_source: Option<std::net::SocketAddr>,
+    pub camera_frames_sent: u32,
     pub incoming_audio_pkts_sent: u32,
     pub incoming_audio_pkts_recv: u32,
     pub incoming_video_pkts_sent: u32,
@@ -42,8 +144,42 @@ impl CallTestResult {
             rejection_reason,
             packets_sent: 0,
             packets_received: 0,
+            raw_audio_datagrams: 0,
+            audio_stun_datagrams: 0,
+            audio_srtp_decrypt_failures: 0,
+            audio_initial_remote_addr: None,
+            audio_final_remote_addr: None,
+            audio_first_rtp_source: None,
+            microphone_frames: 0,
+            microphone_non_silent_frames: 0,
+            microphone_peak: 0,
+            microphone_frames_produced: 0,
+            microphone_frames_enqueued: 0,
+            microphone_frames_dropped: 0,
+            microphone_receiver_disconnects: 0,
+            microphone_stream_errors: 0,
+            speaker_frames_received: 0,
+            speaker_samples_rendered: 0,
+            speaker_stream_errors: 0,
             video_packets_sent: 0,
             video_packets_received: 0,
+            raw_video_datagrams: 0,
+            video_stun_datagrams: 0,
+            video_srtcp_datagrams: 0,
+            video_srtp_decrypt_failures: 0,
+            video_vsr_requests_sent: 0,
+            video_keyframe_requests_received: 0,
+            video_receiver_reports_for_local_ssrc: 0,
+            video_rr_fraction_lost: 0,
+            video_rr_cumulative_lost: 0,
+            video_rr_extended_highest_seq: 0,
+            video_rr_jitter: 0,
+            video_first_sequence_sent: 0,
+            video_last_sequence_sent: 0,
+            video_initial_remote_addr: None,
+            video_final_remote_addr: None,
+            video_first_rtp_source: None,
+            camera_frames_sent: 0,
             incoming_audio_pkts_sent: 0,
             incoming_audio_pkts_recv: 0,
             incoming_video_pkts_sent: 0,
@@ -57,20 +193,146 @@ impl CallTestResult {
 
 /// Run an outgoing call test.
 ///
-/// Modes:
 /// - `echo=true`: Call the Echo / Call Quality Tester bot
 /// - `thread_override=Some(id)`: Call a specific 1:1 chat thread
 /// - Otherwise: Call the av-test channel (requires TEAMS_AV_TEST_THREAD_ID env var)
-pub async fn run_call_test(
-    duration_secs: u64,
-    record: bool,
-    echo: bool,
-    thread_override: Option<String>,
-    use_camera: bool,
-    use_display: bool,
-    tone_mode: bool,
+#[derive(Clone, Debug)]
+pub struct CallTestOptions {
+    pub duration_secs: u64,
+    pub record: bool,
+    pub echo: bool,
+    pub thread_override: Option<String>,
+    pub callee_user_id: Option<String>,
+    pub use_camera: bool,
+    pub use_display: bool,
+    pub tone_mode: bool,
+}
+
+pub async fn run_call_test(options: CallTestOptions) -> Result<CallTestResult> {
+    let config = Config::load().context("Failed to load config")?;
+    run_call_test_inner(config, options, None, None).await
+}
+
+#[derive(Clone, Debug)]
+pub enum CallProgress {
+    Dialing,
+    Ringing,
+    Connected,
+}
+
+static MICROPHONE_ENABLED: AtomicBool = AtomicBool::new(true);
+static SPEAKER_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_microphone_enabled(enabled: bool) {
+    MICROPHONE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_speaker_enabled(enabled: bool) {
+    SPEAKER_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn microphone_enabled() -> bool {
+    MICROPHONE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn speaker_enabled() -> bool {
+    SPEAKER_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn reset_media_controls() {
+    set_microphone_enabled(true);
+    set_speaker_enabled(true);
+}
+
+fn caller_id_for_mri(mri: &str) -> Option<&str> {
+    mri.strip_prefix("8:orgid:")
+        .or_else(|| mri.strip_prefix("8:"))
+        .filter(|id| !id.is_empty())
+}
+
+#[cfg(feature = "consumer-webrtc")]
+fn synthetic_video_frame(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let y_size = width * height;
+    let uv_size = (width / 2) * (height / 2);
+    let mut frame = vec![128; y_size + uv_size * 2];
+    let moving_x = (frame_index * 7) % width.max(1);
+    for y in 0..height {
+        for x in 0..width {
+            let checker = ((x / 32) + (y / 32)) % 2 == 0;
+            let in_bar = x.abs_diff(moving_x) < 10;
+            frame[y * width + x] = if in_bar {
+                235
+            } else if checker {
+                48
+            } else {
+                176
+            };
+        }
+    }
+    frame
+}
+
+fn callee_mri_for_thread(
+    thread_id: &str,
+    caller_oid: &str,
+    callee_user_id: Option<&str>,
+) -> Option<String> {
+    let id = extract_callee_oid_from_thread(thread_id, caller_oid).or_else(|| {
+        callee_user_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+    })?;
+    Some(if id.contains(':') {
+        id
+    } else {
+        format!("8:orgid:{id}")
+    })
+}
+
+pub async fn run_call_until_stop(
+    options: CallTestOptions,
+    stop: tokio::sync::watch::Receiver<bool>,
+    progress: tokio::sync::mpsc::UnboundedSender<CallProgress>,
 ) -> Result<CallTestResult> {
     let config = Config::load().context("Failed to load config")?;
+    run_call_until_stop_with_config(config, options, stop, progress).await
+}
+
+pub async fn run_call_until_stop_with_config(
+    config: Config,
+    mut options: CallTestOptions,
+    stop: tokio::sync::watch::Receiver<bool>,
+    progress: tokio::sync::mpsc::UnboundedSender<CallProgress>,
+) -> Result<CallTestResult> {
+    let is_test_call = options.thread_override.as_deref() == Some("__microslop_test_call__");
+    options.duration_secs = if is_test_call { 90 } else { 24 * 60 * 60 };
+    options.echo = is_test_call;
+    if is_test_call {
+        options.thread_override = None;
+    }
+    run_call_test_inner(config, options, Some(stop), Some(progress)).await
+}
+
+async fn run_call_test_inner(
+    config: Config,
+    options: CallTestOptions,
+    mut stop: Option<tokio::sync::watch::Receiver<bool>>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<CallProgress>>,
+) -> Result<CallTestResult> {
+    let CallTestOptions {
+        duration_secs,
+        record,
+        echo,
+        thread_override,
+        callee_user_id,
+        use_camera,
+        use_display,
+        tone_mode,
+    } = options;
+    if let Some(progress) = &progress {
+        let _ = progress.send(CallProgress::Dialing);
+    }
     let skype_token = config
         .get_skype_token()
         .context("No skype token. Run `teams-cli login` first.")?;
@@ -80,14 +342,30 @@ pub async fn run_call_test(
     );
     let skype_token_str = &skype_token.token;
 
-    let ic3_token = config
-        .get_ic3_token()
-        .context("No IC3 token. Run `teams-cli login` first.")?;
+    let teams_access_token = config
+        .get_access_token()
+        .context("No Teams access token. Run `teams-cli login` first.")?;
     anyhow::ensure!(
-        !ic3_token.is_expired(),
-        "IC3 token expired. Run `teams-cli login`."
+        !teams_access_token.is_expired(),
+        "Teams access token expired. Run `teams-cli login`."
     );
-    let ic3_token_str = &ic3_token.token;
+
+    let ic3_token = if config.personal {
+        None
+    } else {
+        let token = config
+            .get_ic3_token()
+            .context("No IC3 token. Run `teams-cli login` first.")?;
+        anyhow::ensure!(
+            !token.is_expired(),
+            "IC3 token expired. Run `teams-cli login`."
+        );
+        Some(token)
+    };
+    let call_token_str = ic3_token
+        .as_ref()
+        .map(|token| token.token.as_str())
+        .unwrap_or(skype_token_str);
 
     let recorder_token_str = if record {
         let recorder_token = config
@@ -108,27 +386,20 @@ pub async fn run_call_test(
         .context("No region_gtms in config. Run `teams-cli login` first.")?;
     let http = reqwest::Client::new();
 
-    // Extract caller MRI from skype token (JWT)
     let caller_mri = extract_mri_from_skype_token(skype_token_str)
         .context("Cannot extract MRI from skype token")?;
     tracing::info!("Caller MRI: {}", caller_mri);
 
-    // Extract OID from MRI (e.g. "8:orgid:{guid}" -> "{guid}")
-    let caller_oid = caller_mri
-        .strip_prefix("8:orgid:")
-        .context("MRI does not have expected 8:orgid: prefix")?;
+    let caller_oid = caller_id_for_mri(&caller_mri)
+        .context("Caller MRI does not have the expected 8: prefix")?;
 
-    // Determine thread ID and call mode based on options:
-    // 1. --echo: call the Echo bot
-    // 2. --thread <id>: call a specific 1:1 thread
-    // 3. otherwise: channel call via TEAMS_AV_TEST_THREAD_ID env var
     let (thread_id, callee_mri) = if echo {
         (signaling::echo_thread_id(caller_oid), None)
     } else if let Some(ref tid) = thread_override {
-        // Extract callee OID from 1:1 thread format: 19:{oid1}_{oid2}@unq.gbl.spaces
-        let callee_oid = extract_callee_oid_from_thread(tid, caller_oid);
-        let callee_mri = callee_oid.map(|oid| format!("8:orgid:{}", oid));
-        (tid.clone(), callee_mri)
+        (
+            tid.clone(),
+            callee_mri_for_thread(tid, caller_oid, callee_user_id.as_deref()),
+        )
     } else {
         let tid = std::env::var("TEAMS_AV_TEST_THREAD_ID").context(
             "TEAMS_AV_TEST_THREAD_ID env var not set. Set it to the thread ID of the av-test channel.",
@@ -137,16 +408,16 @@ pub async fn run_call_test(
         (tid, None)
     };
 
-    // Determine if this is a 1:1 call (echo or thread override with callee)
     let is_1to1_call = echo || callee_mri.is_some();
 
-    // Get tenant ID
     let tenant_id = config
         .tenant_id
         .as_deref()
+        .or(config
+            .personal
+            .then_some(ost_microsoft::auth::PERSONAL_TENANT_ID))
         .context("No tenant_id in config. Run `teams-cli login` first.")?;
 
-    // Fetch user profile for display name
     let (display_name, mail) = match &graph_token {
         Some(gt) if !gt.is_expired() => {
             let me = fetch_me(&http, &gt.token).await.ok();
@@ -183,14 +454,12 @@ pub async fn run_call_test(
         println!("Record:   enabled");
     }
 
-    // 1. Connect Trouter
     tracing::info!("Negotiating Trouter session...");
     let (trouter_session, epid) = session::negotiate(&http, skype_token_str).await?;
     let session_id =
         session::get_session_id(&http, &trouter_session, skype_token_str, &epid).await?;
     let mut ws = websocket::TrouterSocket::connect(&trouter_session, &session_id, &epid).await?;
 
-    // Wait for handshake
     let frame = ws
         .recv_frame()
         .await?
@@ -198,13 +467,14 @@ pub async fn run_call_test(
     if !frame.starts_with("1::") {
         tracing::warn!("Expected 1:: handshake, got: {}", frame);
     }
+    ws.authenticate(&teams_access_token.token, &trouter_session)
+        .await
+        .context("Could not authenticate outgoing-call Trouter session")?;
 
-    // 2. Register paths
     if let Some(ref reg_url) = trouter_session.registrar_url {
         registrar::register(&http, skype_token_str, reg_url, &trouter_session.surl).await?;
     }
 
-    // 3. Bind UDP sockets for audio and video, gather ICE candidates
     let audio_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
     let audio_port = audio_socket.local_addr()?.port();
     let video_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -245,16 +515,15 @@ pub async fn run_call_test(
         video_candidates.push(srflx);
     }
 
-    // 4. Generate AV SDP offer (audio + video)
     let our_audio_ufrag = sdp::generate_ice_ufrag();
     let our_audio_pwd = sdp::generate_ice_pwd();
     let our_video_ufrag = sdp::generate_ice_ufrag();
     let our_video_pwd = sdp::generate_ice_pwd();
-    // Generate SSRCs early so we can include them in SDP x-ssrc-range attributes.
     let video_ssrc = video::generate_ssrc();
     let audio_ssrc = video::generate_ssrc();
     let offer_result = sdp::generate_av_sdp_offer(&sdp::AvSdpParams {
         local_ip: &local_ip,
+        include_video: use_camera,
         audio_port,
         video_port,
         audio_ufrag: &our_audio_ufrag,
@@ -266,25 +535,72 @@ pub async fn run_call_test(
         video_ssrc_base: video_ssrc,
         audio_ssrc,
     });
+    let call_offer_sdp = offer_result.sdp.clone();
+    #[cfg(feature = "consumer-webrtc")]
+    let mut call_offer_sdp = call_offer_sdp;
+    #[cfg(feature = "consumer-webrtc")]
+    let mut personal_webrtc = if config.personal {
+        let (session, offer) =
+            crate::calling::personal_webrtc::PersonalWebRtcSession::create(use_camera)
+                .await
+                .context("Failed to create Teams Free WebRTC offer")?;
+        call_offer_sdp = offer;
+        Some(session)
+    } else {
+        None
+    };
 
     tracing::info!(
         "AV SDP offer ({} bytes):\n{}",
-        offer_result.sdp.len(),
-        offer_result.sdp
+        call_offer_sdp.len(),
+        call_offer_sdp
     );
 
-    // 5. Derive epconv URL from region_gtms
-    let epconv_url =
-        derive_epconv_url(&region_gtms).context("Cannot derive epconv URL from region_gtms")?;
+    #[cfg(any(feature = "video-capture", feature = "video-capture-windows"))]
+    let (_outgoing_camera_capture, mut outgoing_camera_rx) = if use_camera && !echo {
+        crate::calling::external_display::clear_local();
+        match camera::CameraCapture::start(None, 320, 240, 30) {
+            Ok((capture, source_rx)) => {
+                let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel(2);
+                std::thread::spawn(move || {
+                    while let Ok(frame) = source_rx.recv() {
+                        crate::calling::external_display::push_local_frame(
+                            frame.width,
+                            frame.height,
+                            frame.data.clone(),
+                        );
+                        match preview_tx.try_send(frame) {
+                            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                        }
+                    }
+                });
+                tracing::info!("Camera capture started for outgoing preview");
+                (Some(capture), Some(preview_rx))
+            }
+            Err(error) => {
+                tracing::warn!("Failed to start outgoing camera preview: {error:#}");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
-    // 6. Two-phase call placement
-    let endpoint_id = uuid::Uuid::new_v4().to_string();
+    let epconv_url = if config.personal {
+        ost_microsoft::calling::PERSONAL_CALL_CONVERSATION_URL.to_string()
+    } else {
+        derive_epconv_url(&region_gtms).context("Cannot derive epconv URL from region_gtms")?
+    };
+
+    let endpoint_id = epid.clone();
     let participant_id = uuid::Uuid::new_v4().to_string();
     let chain_id = uuid::Uuid::new_v4().to_string();
     let message_id = uuid::Uuid::new_v4().to_string();
 
     let conv_params = signaling::ConversationCallParams {
-        ic3_token: ic3_token_str,
+        call_token: call_token_str,
+        personal: config.personal,
         trouter_surl: &trouter_session.surl,
         caller_mri: &caller_mri,
         caller_display_name: &display_name,
@@ -297,16 +613,22 @@ pub async fn run_call_test(
         tenant_id,
     };
 
-    // Place the call: 1:1 calls (echo or thread) use single-shot epconv, channel uses two-phase
-    let (phase1, _phase2) = if is_1to1_call {
-        // 1:1 call: single POST to epconv with SDP
+    let echo_needs_invite = echo && !use_camera;
+    let (phase1, _phase2) = if echo && use_camera {
+        tracing::info!("Creating Microsoft video Test Call...");
+        signaling::create_echo_call(&http, &epconv_url, &conv_params, &call_offer_sdp).await?
+    } else if is_1to1_call {
         tracing::info!("Creating 1:1 call (single-shot epconv with SDP)...");
-        let (created, joined) =
-            signaling::create_1to1_call(&http, &epconv_url, &conv_params, &offer_result.sdp)
-                .await?;
-        (created, joined)
+        signaling::create_1to1_call(
+            &http,
+            &epconv_url,
+            &conv_params,
+            &call_offer_sdp,
+            config.personal.then_some(callee_mri.as_deref()).flatten(),
+            use_camera,
+        )
+        .await?
     } else {
-        // Channel call: two-phase (create conversation, then join with SDP)
         tracing::info!("Phase 1: Creating conversation...");
         let created = signaling::create_conversation(&http, &epconv_url, &conv_params).await?;
         tracing::info!(
@@ -319,7 +641,7 @@ pub async fn run_call_test(
             &http,
             &created.conversation_controller,
             &conv_params,
-            &offer_result.sdp,
+            &call_offer_sdp,
         )
         .await?;
         tracing::info!(
@@ -330,26 +652,63 @@ pub async fn run_call_test(
     };
     println!("call_placed=true");
 
-    // 1:1 calls: invite the callee after creating the conversation
-    if echo {
+    if echo_needs_invite {
         tracing::info!("Inviting Echo bot...");
-        signaling::invite_echo_bot(&http, &phase1.conversation_controller, &conv_params).await?;
-    } else if let Some(ref mri) = callee_mri {
-        tracing::info!("Inviting user {}...", mri);
-        signaling::invite_user(
+        signaling::invite_echo_bot(
             &http,
             &phase1.conversation_controller,
+            phase1.add_participant_url.as_deref(),
             &conv_params,
-            mri,
-            use_camera,
         )
         .await?;
+    } else if !config.personal {
+        if let Some(ref mri) = callee_mri {
+            signaling::invite_user(
+                &http,
+                &phase1.conversation_controller,
+                phase1.add_participant_url.as_deref(),
+                &conv_params,
+                mri,
+                use_camera,
+            )
+            .await?;
+        }
     }
 
-    // 7. Wait for mediaAnswer on Trouter
-    tracing::info!("Waiting for media answer on Trouter...");
-    let acceptance = match wait_for_call_acceptance(&mut ws, Duration::from_secs(30)).await {
+    if let Some(progress) = &progress {
+        let _ = progress.send(CallProgress::Ringing);
+    }
+
+    let acceptance_timeout = Duration::from_secs(if echo { 30 } else { 120 });
+    tracing::info!(
+        "Waiting up to {}s for media answer on Trouter...",
+        acceptance_timeout.as_secs()
+    );
+    let acceptance_result = if let Some(stop_receiver) = stop.as_mut() {
+        tokio::select! {
+            result = wait_for_call_acceptance(&mut ws, acceptance_timeout) => Some(result),
+            changed = stop_receiver.changed() => {
+                if changed.is_ok() && *stop_receiver.borrow() {
+                    None
+                } else {
+                    Some(Err(anyhow::anyhow!("Call stop signal closed while waiting for acceptance")))
+                }
+            }
+        }
+    } else {
+        Some(wait_for_call_acceptance(&mut ws, acceptance_timeout).await)
+    };
+    let Some(acceptance_result) = acceptance_result else {
+        tracing::info!("Call cancelled while waiting for acceptance");
+        return Ok(CallTestResult::failed(Some("Call cancelled".to_owned())));
+    };
+    let acceptance = match acceptance_result {
         Ok(acc) => {
+            if let Some(ref ack_url) = acc.acknowledgement_url {
+                signaling::acknowledge_call_acceptance(&http, ack_url, &conv_params)
+                    .await
+                    .context("Failed to acknowledge call acceptance")?;
+            }
             if let Some(ref reason) = acc.rejection_reason {
                 tracing::warn!("Call rejected: {}", reason);
                 println!("call_accepted=false");
@@ -361,19 +720,72 @@ pub async fn run_call_test(
         Err(e) => {
             tracing::warn!("No call acceptance received: {:#}", e);
             println!("call_accepted=false");
-            return Ok(CallTestResult::failed(None));
+            return Ok(CallTestResult::failed(Some(format!("{e:#}"))));
         }
     };
     println!("call_accepted=true");
 
-    // 7b. Phase 3: Acknowledge call acceptance and register CC callbacks
-    if let Some(ref ack_url) = acceptance.acknowledgement_url {
-        if let Err(e) = signaling::acknowledge_call_acceptance(&http, ack_url, &conv_params).await {
-            tracing::warn!("Failed to acknowledge call acceptance: {:#}", e);
+    #[cfg(feature = "consumer-webrtc")]
+    if let Some(mut session) = personal_webrtc.take() {
+        let remote_sdp = acceptance
+            .sdp_blob
+            .clone()
+            .context("Teams Free accepted the call without SDP")?;
+        session
+            .set_answer(remote_sdp)
+            .await
+            .context("Failed to apply Teams Free WebRTC answer")?;
+        let mut result = CallTestResult::failed(None);
+        result.call_accepted = true;
+        match session.wait_connected(Duration::from_secs(15)).await {
+            Ok(()) if use_camera => {
+                let width = 320usize;
+                let height = 240usize;
+                let frame_duration = Duration::from_millis(33);
+                let mut encoder = codec::H264Encoder::new(width as u32, height as u32, 30.0, 700)
+                    .context("Failed to create Teams Free H264 encoder")?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
+                let mut ticker = tokio::time::interval(frame_duration);
+                let mut frame_index = 0usize;
+                while tokio::time::Instant::now() < deadline {
+                    ticker.tick().await;
+                    if frame_index.is_multiple_of(60) {
+                        encoder.force_intra_frame();
+                    }
+                    let yuv = synthetic_video_frame(width, height, frame_index);
+                    let nals = encoder
+                        .encode(&yuv)
+                        .context("Failed to encode Teams Free synthetic video frame")?;
+                    session
+                        .write_h264_nals(&nals, frame_duration)
+                        .await
+                        .context("Failed to send Teams Free synthetic video frame")?;
+                    frame_index += 1;
+                }
+                result.camera_frames_sent = frame_index as u32;
+                tracing::info!("Teams Free synthetic video frames sent: {frame_index}");
+            }
+            Ok(()) => {
+                tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+            }
+            Err(error) => {
+                result.rejection_reason =
+                    Some(format!("Teams Free media did not connect: {error:#}"));
+            }
         }
-    } else {
-        tracing::error!(
-            "No acknowledgement URL in callAcceptance — call WILL time out (430/10065)"
+        if let Some(ref end_url) = acceptance.end_url {
+            if let Err(error) = end_call_by_url(&http, skype_token_str, end_url).await {
+                tracing::warn!("Failed to end Teams Free test call: {error:#}");
+            }
+        }
+        return Ok(result);
+    }
+
+    let mut active_ws = Some(ws);
+
+    if acceptance.acknowledgement_url.is_none() {
+        tracing::info!(
+            "Media answer has no acknowledgement URL; waiting for later call acceptance"
         );
     }
 
@@ -385,31 +797,33 @@ pub async fn run_call_test(
         tracing::warn!("No callLeg URL in callAcceptance — skipping CC callback registration");
     }
 
-    // 8. Set up media leg
-    let mut outgoing_leg = setup_media_leg(
-        &offer_result.audio_crypto_line,
-        &offer_result.video_crypto_line,
-        &our_audio_ufrag,
-        &our_audio_pwd,
-        &our_video_ufrag,
-        &our_video_pwd,
-        &acceptance.sdp_blob.clone().unwrap_or_default(),
+    let remote_sdp = acceptance.sdp_blob.clone().unwrap_or_default();
+    let media_setup = setup_media_leg(MediaLegSetup {
+        local_audio_crypto_line: &offer_result.audio_crypto_line,
+        local_video_crypto_line: &offer_result.video_crypto_line,
+        local_audio_ufrag: &our_audio_ufrag,
+        local_audio_pwd: &our_audio_pwd,
+        local_video_ufrag: &our_video_ufrag,
+        local_video_pwd: &our_video_pwd,
+        remote_sdp: &remote_sdp,
         audio_socket,
         video_socket,
-        "outgoing",
-        true,
+        label: "outgoing",
+        controlling: true,
+        audio_ssrc,
         video_ssrc,
-    )
-    .await
+    });
+    let mut outgoing_leg = if let Some(ws) = active_ws.as_mut() {
+        await_with_call_signaling(ws, media_setup, &http, &conv_params, &call_offer_sdp).await
+    } else {
+        media_setup.await
+    }
     .context("Failed to set up outgoing media leg")?;
 
-    // 9. Initialize audio FIRST — before SDL2 display, which can interfere with
-    // audio device enumeration on Linux (PulseAudio/ALSA).
     let recorder = Arc::new(Mutex::new(test_tone::AudioRecorder::new(
         (duration_secs as usize) * 8000,
     )));
 
-    // Open speaker output for received audio (requires --features audio)
     #[cfg(feature = "audio")]
     let (_audio_playback, speaker_tx) = {
         match super::audio::AudioPlayback::start() {
@@ -426,7 +840,6 @@ pub async fn run_call_test(
     #[cfg(not(feature = "audio"))]
     let speaker_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>> = None;
 
-    // Open microphone capture (requires --features audio, and not --tone)
     #[cfg(feature = "audio")]
     let (_audio_capture, mic_rx) = if !tone_mode {
         match super::audio::AudioCapture::start() {
@@ -446,56 +859,56 @@ pub async fn run_call_test(
     #[cfg(not(feature = "audio"))]
     let mic_rx: Option<std::sync::mpsc::Receiver<Vec<i16>>> = None;
 
-    // 9a. Initialize camera and display AFTER audio (SDL2 can interfere with audio)
-    #[cfg(feature = "video-capture")]
-    {
-        if use_camera {
-            match camera::CameraCapture::start(None, 320, 240, 15) {
+    #[cfg(any(feature = "video-capture", feature = "video-capture-windows"))]
+    if use_camera {
+        if let Some(rx) = outgoing_camera_rx.take() {
+            tracing::info!("Using outgoing preview camera capture for call media");
+            outgoing_leg.camera_rx = Some(rx);
+        } else {
+            match camera::CameraCapture::start(None, 320, 240, 30) {
                 Ok((_capture, rx)) => {
-                    tracing::info!("Camera capture started (320x240 @ 15fps)");
+                    tracing::info!("Camera capture started (320x240 @ 30fps)");
                     outgoing_leg.camera_rx = Some(rx);
-                    // Keep capture handle alive by leaking it (it lives until process exit)
-                    std::mem::forget(_capture);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to start camera: {:#}. Falling back to black frames.",
-                        e
-                    );
-                }
+                Err(e) => tracing::warn!("Failed to start camera: {:#}", e),
             }
         }
-        if use_display {
-            match display::VideoDisplay::start("Teams Video - Received") {
-                Ok((_display, tx)) => {
-                    tracing::info!("Video display window opened");
-                    outgoing_leg.display_tx = Some(tx);
-                    std::mem::forget(_display);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to open video display: {:#}", e);
-                }
+    }
+    #[cfg(all(feature = "video-codec", target_os = "android"))]
+    if use_camera {
+        outgoing_leg.camera_rx = Some(external_camera::subscribe());
+    }
+    outgoing_leg.decode_remote_video = use_display || use_camera;
+    #[cfg(feature = "video-capture")]
+    if use_display {
+        match display::VideoDisplay::start("Teams Video - Received") {
+            Ok((_display, tx)) => {
+                tracing::info!("Video display window opened");
+                outgoing_leg.display_tx = Some(tx);
             }
+            Err(e) => tracing::warn!("Failed to open video display: {:#}", e),
         }
+    }
+    #[cfg(not(feature = "video-codec"))]
+    if use_camera {
+        tracing::warn!("Camera requested without video codec support");
     }
     #[cfg(not(feature = "video-capture"))]
-    {
-        if use_camera || use_display {
-            tracing::warn!("Video capture/display requested but binary was not built with --features video-capture");
-        }
+    if use_display {
+        tracing::warn!("Video display requested without video capture support");
     }
 
-    let outgoing_handles = spawn_media_leg(
-        outgoing_leg,
-        &caller_mri,
-        Some(recorder.clone()),
-        false,
+    let outgoing_handles = spawn_media_leg(MediaLegSpawn {
+        leg: outgoing_leg,
+        cname: &caller_mri,
+        recorder: Some(recorder.clone()),
+        loopback: false,
         speaker_tx,
         mic_rx,
-    );
+        tone_mode,
+        progress: progress.clone(),
+    });
 
-    // 8b. Start recording in background after a short delay to let audio establish.
-    // Recording is non-blocking: if it fails, the call continues normally.
     let mut recording_handle = None;
     if record {
         if let Some(rec_token) = recorder_token_str {
@@ -510,28 +923,36 @@ pub async fn run_call_test(
             let thread_id = thread_id.clone();
             let display_name = display_name.clone();
             let trouter_surl = trouter_session.surl.clone();
-            let ic3_token = ic3_token_str.to_string();
+            let ic3_token = ic3_token
+                .as_ref()
+                .context("Recording requires an IC3 token")?
+                .token
+                .clone();
             let skype_token = skype_token_str.to_string();
+            let mut recording_ws = active_ws
+                .take()
+                .context("Trouter unavailable for recording")?;
             recording_handle = Some(tokio::spawn(async move {
-                // Let audio flow for 3 seconds before injecting the recorder
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 tracing::info!("Starting call recording (background, after 3s media warm-up)...");
                 match recording::start_call_recording(
                     &http,
-                    &mut ws,
-                    &conversation_controller,
-                    &caller_mri,
-                    &participant_id,
-                    &endpoint_id,
-                    &chain_id,
-                    &message_id,
-                    &thread_id,
-                    &display_name,
-                    &trouter_surl,
-                    &ic3_token,
-                    &rec_token,
-                    &skype_token,
-                    add_participant_url_override.as_deref(),
+                    &mut recording_ws,
+                    recording::RecordingRequest {
+                        caller_mri: &caller_mri,
+                        participant_id: &participant_id,
+                        endpoint_id: &endpoint_id,
+                        chain_id: &chain_id,
+                        message_id: &message_id,
+                        thread_id: &thread_id,
+                        display_name: &display_name,
+                        trouter_surl: &trouter_surl,
+                        ic3_token: &ic3_token,
+                        recorder_token: &rec_token,
+                        skype_token: &skype_token,
+                        conversation_controller: &conversation_controller,
+                        add_participant_url_override: add_participant_url_override.as_deref(),
+                    },
                 )
                 .await
                 {
@@ -548,14 +969,83 @@ pub async fn run_call_test(
         }
     }
 
-    // 10. Wait for test duration
-    tracing::info!("Call active, running for {}s...", duration_secs);
-    tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+    let interactive_test_call = echo && progress.is_some();
+    let mut media_failure_reason = None;
+    if interactive_test_call {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if outgoing_handles
+                .audio_first_rtp_source
+                .lock()
+                .await
+                .is_some()
+            {
+                break;
+            }
+            if stop.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                media_failure_reason =
+                    Some("Microsoft answered but no inbound audio media arrived".to_string());
+                tracing::warn!("Test call media connection timed out after 15s");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
-    // 11. Stop media
+    if media_failure_reason.is_none() && !stop.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+        tracing::info!("Call active, running for up to {}s...", duration_secs);
+        if let Some(ws) = active_ws.as_mut() {
+            let duration = if interactive_test_call {
+                duration_secs.min(35)
+            } else {
+                duration_secs
+            };
+            let call_end = wait_for_call_end(
+                ws,
+                Duration::from_secs(duration),
+                &http,
+                &conv_params,
+                &offer_result.sdp,
+                Some(&outgoing_handles),
+            );
+            let result = if let Some(stop) = stop.as_mut() {
+                tokio::select! {
+                    result = call_end => result,
+                    _ = stop.changed() => Ok(None),
+                }
+            } else {
+                call_end.await
+            };
+            match result {
+                Ok(reason) => media_failure_reason = reason,
+                Err(error) => {
+                    media_failure_reason = Some(format!("Call signaling failed: {error:#}"))
+                }
+            }
+        } else if let Some(stop) = stop.as_mut() {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(duration_secs)) => {},
+                _ = stop.changed() => {
+                    tracing::info!("Call stop requested by client");
+                }
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+        }
+    }
+
     outgoing_handles.abort_all();
+    #[cfg(all(feature = "video-codec", target_os = "android"))]
+    external_camera::clear();
+    #[cfg(all(
+        feature = "video-codec",
+        any(target_os = "android", target_os = "windows")
+    ))]
+    super::external_display::clear();
 
-    // 11b. Stop recording if active
     if let Some(handle) = recording_handle {
         match handle.await {
             Ok(Some(session)) => {
@@ -563,15 +1053,13 @@ pub async fn run_call_test(
                     tracing::warn!("Stop recording failed (non-fatal): {:#}", e);
                 }
             }
-            Ok(None) => {} // recording never started successfully
+            Ok(None) => {}
             Err(e) => tracing::warn!("Recording task panicked: {:#}", e),
         }
     }
 
-    // 12. End call
     let end_url = acceptance.end_url.clone().or_else(|| {
         acceptance.call_leg_url.as_ref().map(|u| {
-            // Insert /end before query string: .../path?q=x -> .../path/end?q=x
             if let Some(idx) = u.find('?') {
                 format!("{}/end{}", &u[..idx], &u[idx..])
             } else {
@@ -585,11 +1073,17 @@ pub async fn run_call_test(
         tracing::warn!("No end URL or call_leg_url available — cannot hang up");
     }
 
-    // 13. Analyze echo and collect stats
     let rec = recorder.lock().await;
-    let echo_result = test_tone::detect_echo(rec.samples(), 1000.0, 8000.0);
+    let echo_result = if tone_mode {
+        test_tone::detect_echo(rec.samples(), 1000.0, 8000.0)
+    } else {
+        test_tone::EchoResult {
+            detected: false,
+            delay_ms: 0.0,
+            correlation_peak: 0.0,
+        }
+    };
 
-    // Dump received audio to raw files for offline analysis
     {
         let pcm_path = "/tmp/received_audio.pcm";
         let samples = rec.samples();
@@ -612,15 +1106,120 @@ pub async fn run_call_test(
     let out_rs = outgoing_handles.recv_stats.lock().await;
     let out_vid_ss = outgoing_handles.video_send_stats.lock().await;
     let out_vid_rs = outgoing_handles.video_recv_stats.lock().await;
+    #[cfg(feature = "audio")]
+    let (
+        microphone_frames_produced,
+        microphone_frames_enqueued,
+        microphone_frames_dropped,
+        microphone_receiver_disconnects,
+        microphone_stream_errors,
+    ) = _audio_capture
+        .as_ref()
+        .map(super::audio::AudioCapture::stats)
+        .map(|stats| {
+            (
+                stats.produced(),
+                stats.enqueued(),
+                stats.full(),
+                stats.disconnected(),
+                stats.stream_errors(),
+            )
+        })
+        .unwrap_or_default();
+    #[cfg(not(feature = "audio"))]
+    let (
+        microphone_frames_produced,
+        microphone_frames_enqueued,
+        microphone_frames_dropped,
+        microphone_receiver_disconnects,
+        microphone_stream_errors,
+    ) = (0, 0, 0, 0, 0);
+    #[cfg(feature = "audio")]
+    let (speaker_frames_received, speaker_samples_rendered, speaker_stream_errors) =
+        _audio_playback
+            .as_ref()
+            .map(super::audio::AudioPlayback::stats)
+            .map(|stats| {
+                (
+                    stats.frames_received(),
+                    stats.samples_rendered(),
+                    stats.stream_errors(),
+                )
+            })
+            .unwrap_or_default();
+    #[cfg(not(feature = "audio"))]
+    let (speaker_frames_received, speaker_samples_rendered, speaker_stream_errors) = (0, 0, 0);
 
     let result = CallTestResult {
         call_placed: true,
         call_accepted: true,
-        rejection_reason: None,
+        rejection_reason: media_failure_reason,
         packets_sent: out_ss.packets_sent,
         packets_received: out_rs.packets_received,
+        raw_audio_datagrams: outgoing_handles.raw_audio_datagrams.load(Ordering::Relaxed),
+        audio_stun_datagrams: outgoing_handles
+            .audio_stun_datagrams
+            .load(Ordering::Relaxed),
+        audio_srtp_decrypt_failures: outgoing_handles
+            .audio_srtp_decrypt_failures
+            .load(Ordering::Relaxed),
+        audio_initial_remote_addr: Some(outgoing_handles.audio_initial_remote_addr),
+        audio_final_remote_addr: Some(*outgoing_handles.audio_dynamic_remote_addr.lock().await),
+        audio_first_rtp_source: *outgoing_handles.audio_first_rtp_source.lock().await,
+        microphone_frames: outgoing_handles.microphone_frames.load(Ordering::Relaxed),
+        microphone_non_silent_frames: outgoing_handles
+            .microphone_non_silent_frames
+            .load(Ordering::Relaxed),
+        microphone_peak: outgoing_handles.microphone_peak.load(Ordering::Relaxed),
+        microphone_frames_produced,
+        microphone_frames_enqueued,
+        microphone_frames_dropped,
+        microphone_receiver_disconnects,
+        microphone_stream_errors,
+        speaker_frames_received,
+        speaker_samples_rendered,
+        speaker_stream_errors,
         video_packets_sent: out_vid_ss.packets_sent,
         video_packets_received: out_vid_rs.packets_received,
+        raw_video_datagrams: outgoing_handles.raw_video_datagrams.load(Ordering::Relaxed),
+        video_stun_datagrams: outgoing_handles
+            .video_stun_datagrams
+            .load(Ordering::Relaxed),
+        video_srtcp_datagrams: outgoing_handles
+            .video_srtcp_datagrams
+            .load(Ordering::Relaxed),
+        video_srtp_decrypt_failures: outgoing_handles
+            .video_srtp_decrypt_failures
+            .load(Ordering::Relaxed),
+        video_vsr_requests_sent: outgoing_handles
+            .video_vsr_requests_sent
+            .load(Ordering::Relaxed),
+        video_keyframe_requests_received: outgoing_handles
+            .video_keyframe_requests_received
+            .load(Ordering::Relaxed),
+        video_receiver_reports_for_local_ssrc: outgoing_handles
+            .video_receiver_reports_for_local_ssrc
+            .load(Ordering::Relaxed),
+        video_rr_fraction_lost: outgoing_handles
+            .video_rr_fraction_lost
+            .load(Ordering::Relaxed),
+        video_rr_cumulative_lost: outgoing_handles
+            .video_rr_cumulative_lost
+            .load(Ordering::Relaxed),
+        video_rr_extended_highest_seq: outgoing_handles
+            .video_rr_extended_highest_seq
+            .load(Ordering::Relaxed),
+        video_rr_jitter: outgoing_handles.video_rr_jitter.load(Ordering::Relaxed),
+        video_first_sequence_sent: outgoing_handles
+            .video_first_sequence_sent
+            .load(Ordering::Relaxed),
+        video_last_sequence_sent: outgoing_handles
+            .video_last_sequence_sent
+            .load(Ordering::Relaxed),
+        video_initial_remote_addr: outgoing_handles.video_initial_remote_addr,
+        video_final_remote_addr: *outgoing_handles.video_dynamic_remote_addr.lock().await,
+        video_first_rtp_source: *outgoing_handles.video_first_rtp_source.lock().await,
+        camera_frames_sent: outgoing_handles.camera_frames_sent.load(Ordering::Relaxed),
         incoming_audio_pkts_sent: 0,
         incoming_audio_pkts_recv: 0,
         incoming_video_pkts_sent: 0,
@@ -632,1270 +1231,102 @@ pub async fn run_call_test(
 
     println!("audio_packets_sent={}", result.packets_sent);
     println!("audio_packets_received={}", result.packets_received);
+    println!("raw_audio_datagrams={}", result.raw_audio_datagrams);
+    println!("audio_stun_datagrams={}", result.audio_stun_datagrams);
+    println!(
+        "audio_srtp_decrypt_failures={}",
+        result.audio_srtp_decrypt_failures
+    );
+    println!(
+        "audio_initial_remote_addr={:?}",
+        result.audio_initial_remote_addr
+    );
+    println!(
+        "audio_final_remote_addr={:?}",
+        result.audio_final_remote_addr
+    );
+    println!("audio_first_rtp_source={:?}", result.audio_first_rtp_source);
+    println!("microphone_frames={}", result.microphone_frames);
+    println!(
+        "microphone_non_silent_frames={}",
+        result.microphone_non_silent_frames
+    );
+    println!("microphone_peak={}", result.microphone_peak);
+    println!(
+        "microphone_frames_produced={}",
+        result.microphone_frames_produced
+    );
+    println!(
+        "microphone_frames_enqueued={}",
+        result.microphone_frames_enqueued
+    );
+    println!(
+        "microphone_frames_dropped={}",
+        result.microphone_frames_dropped
+    );
+    println!(
+        "microphone_receiver_disconnects={}",
+        result.microphone_receiver_disconnects
+    );
+    println!(
+        "microphone_stream_errors={}",
+        result.microphone_stream_errors
+    );
+    println!("speaker_frames_received={}", result.speaker_frames_received);
+    println!(
+        "speaker_samples_rendered={}",
+        result.speaker_samples_rendered
+    );
+    println!("speaker_stream_errors={}", result.speaker_stream_errors);
+    println!("camera_frames_sent={}", result.camera_frames_sent);
     println!("video_packets_sent={}", result.video_packets_sent);
     println!("video_packets_received={}", result.video_packets_received);
+    println!("raw_video_datagrams={}", result.raw_video_datagrams);
+    println!("video_stun_datagrams={}", result.video_stun_datagrams);
+    println!("video_srtcp_datagrams={}", result.video_srtcp_datagrams);
+    println!(
+        "video_srtp_decrypt_failures={}",
+        result.video_srtp_decrypt_failures
+    );
+    println!("video_vsr_requests_sent={}", result.video_vsr_requests_sent);
+    println!(
+        "video_keyframe_requests_received={}",
+        result.video_keyframe_requests_received
+    );
+    println!(
+        "video_receiver_reports_for_local_ssrc={}",
+        result.video_receiver_reports_for_local_ssrc
+    );
+    println!("video_rr_fraction_lost={}", result.video_rr_fraction_lost);
+    println!(
+        "video_rr_cumulative_lost={}",
+        result.video_rr_cumulative_lost
+    );
+    println!(
+        "video_rr_extended_highest_seq={}",
+        result.video_rr_extended_highest_seq
+    );
+    println!("video_rr_jitter={}", result.video_rr_jitter);
+    println!(
+        "video_first_sequence_sent={}",
+        result.video_first_sequence_sent
+    );
+    println!(
+        "video_last_sequence_sent={}",
+        result.video_last_sequence_sent
+    );
+    println!(
+        "video_initial_remote_addr={:?}",
+        result.video_initial_remote_addr
+    );
+    println!(
+        "video_final_remote_addr={:?}",
+        result.video_final_remote_addr
+    );
+    println!("video_first_rtp_source={:?}", result.video_first_rtp_source);
     println!("echo_detected={}", result.echo_detected);
     println!("echo_delay_ms={:.1}", result.echo_delay_ms);
     println!("echo_correlation={:.3}", result.echo_correlation);
 
     Ok(result)
-}
-
-/// Derive the epconv URL from region_gtms.
-///
-/// Uses calling_conversationServiceUrl directly if available,
-/// otherwise falls back to extracting the regional base from potentialCallRequestUrl.
-fn derive_epconv_url(region_gtms: &serde_json::Value) -> Option<String> {
-    // Allow env var override for testing different regions
-    if let Ok(url) = std::env::var("TEAMS_EPCONV_URL") {
-        return Some(url);
-    }
-    // Prefer the explicit conversationServiceUrl from GTMS
-    if let Some(url) = region_gtms
-        .get("calling_conversationServiceUrl")
-        .and_then(|v| v.as_str())
-    {
-        return Some(url.to_string());
-    }
-
-    // Fallback: derive from potentialCallRequestUrl
-    let potential_url = region_gtms
-        .get("calling_potentialCallRequestUrl")
-        .and_then(|v| v.as_str())?;
-
-    if let Some(idx) = potential_url.find("/api/v2/") {
-        let base = &potential_url[..idx];
-        Some(format!("{}/api/v2/epconv", base))
-    } else {
-        Some(potential_url.replace("/cc/v1/potentialcall", "/epconv"))
-    }
-}
-
-/// A prepared media leg with sockets, SRTP contexts, and resolved remote addresses.
-struct MediaLeg {
-    label: String,
-    audio_socket: Arc<tokio::net::UdpSocket>,
-    audio_srtp_ctx: Arc<Mutex<srtp::SrtpContext>>,
-    audio_remote_addr: std::net::SocketAddr,
-    audio_local_pwd: String,
-    video_socket: Arc<tokio::net::UdpSocket>,
-    video_srtp_ctx: Option<Arc<Mutex<srtp::SrtpContext>>>,
-    video_remote_addr: Option<std::net::SocketAddr>,
-    video_local_pwd: String,
-    /// Video SSRC matching the SDP x-ssrc-range.
-    video_ssrc: u32,
-    /// Camera frame receiver (when --camera is active).
-    #[cfg(feature = "video-capture")]
-    camera_rx: Option<std::sync::mpsc::Receiver<camera::YuvFrame>>,
-    /// Display frame sender (when --display is active).
-    #[cfg(feature = "video-capture")]
-    display_tx: Option<std::sync::mpsc::SyncSender<display::DisplayFrame>>,
-}
-
-/// Handles to spawned media tasks and shared stats for one leg.
-struct MediaLegHandles {
-    send_stats: Arc<Mutex<rtcp::RtpSendStats>>,
-    recv_stats: Arc<Mutex<rtcp::RtpRecvStats>>,
-    video_send_stats: Arc<Mutex<rtcp::RtpSendStats>>,
-    video_recv_stats: Arc<Mutex<rtcp::RtpRecvStats>>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl MediaLegHandles {
-    fn abort_all(&self) {
-        for h in &self.handles {
-            h.abort();
-        }
-    }
-}
-
-/// Set up a media leg: parse remote SDP, create SRTP contexts, run ICE checks.
-///
-/// `local_audio_crypto_line` / `local_video_crypto_line` are the crypto lines from our SDP
-/// for this leg. `remote_sdp` is the SDP from the other side (the answer for outgoing,
-/// or the notification offer for incoming).
-async fn setup_media_leg(
-    local_audio_crypto_line: &str,
-    local_video_crypto_line: &str,
-    local_audio_ufrag: &str,
-    local_audio_pwd: &str,
-    local_video_ufrag: &str,
-    local_video_pwd: &str,
-    remote_sdp: &str,
-    audio_socket: tokio::net::UdpSocket,
-    video_socket: tokio::net::UdpSocket,
-    label: &str,
-    controlling: bool,
-    video_ssrc: u32,
-) -> Result<MediaLeg> {
-    // Decompress and log the full SDP for debugging
-    let decompressed = crate::calling::sdp_compress::decompress_sdp(remote_sdp)
-        .unwrap_or_else(|_| remote_sdp.to_string());
-    tracing::info!(
-        "[{}] Remote SDP ({} bytes):\n{}",
-        label,
-        decompressed.len(),
-        decompressed
-    );
-
-    let remote_offer = sdp::parse_sdp_offer(remote_sdp)
-        .with_context(|| format!("Failed to parse {} remote SDP", label))?;
-
-    // Audio SRTP
-    let local_material = srtp::parse_crypto_line(local_audio_crypto_line)?;
-    let remote_material = remote_offer
-        .crypto_lines
-        .iter()
-        .find_map(|l| srtp::parse_crypto_line(l).ok())
-        .with_context(|| format!("No audio crypto line in {} remote SDP", label))?;
-    let audio_srtp_ctx = Arc::new(Mutex::new(srtp::create_context(
-        &local_material,
-        &remote_material,
-    )?));
-
-    // Video SRTP
-    let video_srtp_ctx = if let Some(ref vid) = remote_offer.video {
-        let local_vid_material = srtp::parse_crypto_line(local_video_crypto_line)?;
-        let remote_vid_material = vid
-            .crypto_lines
-            .iter()
-            .find_map(|l| srtp::parse_crypto_line(l).ok())
-            .with_context(|| format!("No video crypto line in {} remote SDP", label))?;
-        Some(Arc::new(Mutex::new(srtp::create_context(
-            &local_vid_material,
-            &remote_vid_material,
-        )?)))
-    } else {
-        tracing::info!("[{}] Remote SDP has no video section", label);
-        None
-    };
-
-    // Audio ICE
-    let remote_candidates = ice::parse_candidates_from_sdp(remote_sdp);
-    let remote_creds = ice::IceCredentials {
-        ufrag: remote_offer.ice_ufrag.clone(),
-        pwd: remote_offer.ice_pwd.clone(),
-    };
-    let local_creds = ice::IceCredentials {
-        ufrag: local_audio_ufrag.to_string(),
-        pwd: local_audio_pwd.to_string(),
-    };
-
-    let audio_socket = Arc::new(audio_socket);
-    let agent = ice::IceAgent::new(local_creds, remote_creds, controlling);
-    let audio_remote_addr = match agent
-        .check_connectivity(audio_socket.clone(), &remote_candidates)
-        .await
-    {
-        Ok(result) => {
-            tracing::info!(
-                "[{}] Audio ICE succeeded: remote={}",
-                label,
-                result.remote_addr
-            );
-            result.remote_addr
-        }
-        Err(e) => {
-            tracing::warn!("[{}] Audio ICE failed: {:#}, falling back", label, e);
-            ice::select_remote_candidate(&remote_candidates)
-                .with_context(|| format!("No fallback audio candidate for {}", label))?
-        }
-    };
-
-    // Video ICE
-    let video_socket = Arc::new(video_socket);
-    let video_remote_addr = if let Some(ref vid) = remote_offer.video {
-        let vid_candidates = ice::parse_candidates_from_sdp_section(remote_sdp, "video");
-        tracing::info!(
-            "[{}] Video ICE: {} candidates from SDP, remote video ufrag={}, pwd_len={}",
-            label,
-            vid_candidates.len(),
-            vid.ice_ufrag,
-            vid.ice_pwd.len()
-        );
-        let vid_remote_creds = ice::IceCredentials {
-            ufrag: vid.ice_ufrag.clone(),
-            pwd: vid.ice_pwd.clone(),
-        };
-        let vid_local_creds = ice::IceCredentials {
-            ufrag: local_video_ufrag.to_string(),
-            pwd: local_video_pwd.to_string(),
-        };
-        let vid_agent = ice::IceAgent::new(vid_local_creds, vid_remote_creds, controlling);
-        match vid_agent
-            .check_connectivity(video_socket.clone(), &vid_candidates)
-            .await
-        {
-            Ok(result) => {
-                tracing::info!(
-                    "[{}] Video ICE succeeded: remote={}",
-                    label,
-                    result.remote_addr
-                );
-                Some(result.remote_addr)
-            }
-            Err(e) => {
-                tracing::warn!("[{}] Video ICE failed: {:#}, falling back", label, e);
-                ice::select_remote_candidate(&vid_candidates)
-            }
-        }
-    } else {
-        None
-    };
-
-    Ok(MediaLeg {
-        label: label.to_string(),
-        audio_socket,
-        audio_srtp_ctx,
-        audio_remote_addr,
-        audio_local_pwd: local_audio_pwd.to_string(),
-        video_socket,
-        video_srtp_ctx,
-        video_remote_addr,
-        video_local_pwd: local_video_pwd.to_string(),
-        video_ssrc,
-        #[cfg(feature = "video-capture")]
-        camera_rx: None,
-        #[cfg(feature = "video-capture")]
-        display_tx: None,
-    })
-}
-
-/// Spawn all media send/recv/rtcp loops for a single leg.
-///
-/// If `recorder` is Some, received audio is decoded and recorded (for echo detection).
-/// If `loopback` is true, received audio is decoded and looped back as the send source
-/// instead of generating a test tone — used on the incoming leg for echo verification.
-/// Returns handles and shared stat counters.
-fn spawn_media_leg(
-    mut leg: MediaLeg,
-    cname: &str,
-    recorder: Option<Arc<Mutex<test_tone::AudioRecorder>>>,
-    loopback: bool,
-    speaker_tx: Option<std::sync::mpsc::SyncSender<Vec<i16>>>,
-    mic_rx: Option<std::sync::mpsc::Receiver<Vec<i16>>>,
-) -> MediaLegHandles {
-    let label = leg.label.clone();
-    let mut handles = Vec::new();
-
-    let ssrc = {
-        let id = uuid::Uuid::new_v4();
-        let b = id.as_bytes();
-        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-    };
-
-    let send_stats = Arc::new(Mutex::new(rtcp::RtpSendStats {
-        ssrc,
-        ..Default::default()
-    }));
-    let recv_stats = Arc::new(Mutex::new(rtcp::RtpRecvStats::default()));
-    let remote_ssrc = Arc::new(Mutex::new(0u32));
-
-    let video_ssrc = leg.video_ssrc;
-    let video_send_stats = Arc::new(Mutex::new(rtcp::RtpSendStats {
-        ssrc: video_ssrc,
-        ..Default::default()
-    }));
-    let video_recv_stats = Arc::new(Mutex::new(rtcp::RtpRecvStats::default()));
-    let video_remote_ssrc = Arc::new(Mutex::new(0u32));
-
-    // Loopback channel: recv loop sends decoded PCM frames, send loop consumes them.
-    let (loopback_tx, loopback_rx) = if loopback {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<i16>>(64);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    // Dynamic remote address — updated when we receive STUN checks from a new peer.
-    // In Teams, the MCU's actual relay address may differ from the SDP candidate.
-    let dynamic_remote_addr = Arc::new(Mutex::new(leg.audio_remote_addr));
-
-    // Audio send loop
-    {
-        let socket = leg.audio_socket.clone();
-        let srtp_ctx = leg.audio_srtp_ctx.clone();
-        let send_stats = send_stats.clone();
-        let dynamic_remote = dynamic_remote_addr.clone();
-        let label = label.clone();
-        handles.push(tokio::spawn(async move {
-            let mut tone = test_tone::ToneGenerator::new();
-            let mut seq: u16 = 0;
-            let mut timestamp: u32 = 0;
-            let mut interval = tokio::time::interval(Duration::from_millis(20));
-            let mut loopback_rx = loopback_rx;
-            let mic_rx = mic_rx;
-
-            loop {
-                interval.tick().await;
-
-                // Priority: loopback > microphone > 1kHz tone
-                let samples = if let Some(ref mut rx) = loopback_rx {
-                    match rx.try_recv() {
-                        Ok(s) => s,
-                        Err(_) => vec![0i16; rtp::SAMPLES_PER_PACKET],
-                    }
-                } else if let Some(ref rx) = mic_rx {
-                    match rx.try_recv() {
-                        Ok(s) => s,
-                        Err(_) => vec![0i16; rtp::SAMPLES_PER_PACKET],
-                    }
-                } else {
-                    tone.next_frame()
-                };
-
-                let mut payload = Vec::with_capacity(160);
-                for &s in &samples {
-                    payload.push(rtp::linear_to_ulaw(s));
-                }
-                let rtp_packet = rtp::encode(rtp::PT_PCMU, seq, timestamp, ssrc, &payload);
-
-                let srtp_packet = {
-                    let mut ctx = srtp_ctx.lock().await;
-                    match srtp::protect(&mut ctx, &rtp_packet) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!("[{}] SRTP protect: {:#}", label, e);
-                            continue;
-                        }
-                    }
-                };
-
-                let remote_addr = *dynamic_remote.lock().await;
-                if socket.send_to(&srtp_packet, remote_addr).await.is_ok() {
-                    let mut s = send_stats.lock().await;
-                    s.packets_sent += 1;
-                    s.bytes_sent += payload.len() as u32;
-                    s.last_rtp_timestamp = timestamp;
-                }
-
-                seq = seq.wrapping_add(1);
-                timestamp = timestamp.wrapping_add(160);
-            }
-        }));
-    }
-
-    // Audio recv loop
-    {
-        let socket = leg.audio_socket.clone();
-        let srtp_ctx = leg.audio_srtp_ctx.clone();
-        let recv_stats = recv_stats.clone();
-        let remote_ssrc = remote_ssrc.clone();
-        let recorder = recorder.clone();
-        let loopback_tx = loopback_tx.clone();
-        let local_pwd = leg.audio_local_pwd.clone();
-        let label = label.clone();
-        let dynamic_remote = dynamic_remote_addr.clone();
-        handles.push(tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, from)) => {
-                        let data = &buf[..len];
-
-                        if len >= 20 && ice::is_stun_message(data) {
-                            if ice::is_stun_request(data) {
-                                if let Some(txn_id) = ice::get_transaction_id(data) {
-                                    let resp = ice::build_binding_response(
-                                        &txn_id,
-                                        from,
-                                        Some(local_pwd.as_bytes()),
-                                    );
-                                    let _ = socket.send_to(&resp, from).await;
-                                }
-                                // Update send target to the address that checked us.
-                                // The MCU's actual relay may differ from the SDP candidate.
-                                let mut dr = dynamic_remote.lock().await;
-                                if *dr != from {
-                                    tracing::info!("[{}] Updating remote addr: {} -> {} (peer ICE check)", label, *dr, from);
-                                    *dr = from;
-                                }
-                            }
-                            continue;
-                        }
-
-                        let srtcp_result = {
-                            let mut ctx = srtp_ctx.lock().await;
-                            srtp::unprotect_rtcp(&mut ctx, data).ok()
-                        };
-                        if let Some(rtcp_data) = srtcp_result {
-                            tracing::debug!(
-                                "[{}] Received SRTCP ({} bytes)",
-                                label,
-                                rtcp_data.len()
-                            );
-                            let blocks = rtcp::parse_rtcp(&rtcp_data);
-                            let mut rs = recv_stats.lock().await;
-                            for block in &blocks {
-                                match block {
-                                    rtcp::RtcpBlock::SenderReport { ssrc, ntp_timestamp, sender_packet_count, sender_octet_count, .. } => {
-                                        tracing::info!(
-                                            "[{}] RTCP SR from SSRC={:#010x}: pkt_count={} oct_count={}",
-                                            label, ssrc, sender_packet_count, sender_octet_count
-                                        );
-                                        rs.last_sr_ntp = ((*ntp_timestamp >> 16) & 0xFFFF_FFFF) as u32;
-                                        rs.last_sr_recv_time = Some(std::time::Instant::now());
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            continue;
-                        }
-
-                        let srtp_result = {
-                            let mut ctx = srtp_ctx.lock().await;
-                            srtp::unprotect(&mut ctx, data)
-                        };
-                        match srtp_result {
-                            Ok(rtp_data) => {
-                                if let Ok(pkt) = rtp::decode(&rtp_data) {
-                                    let mut rs = recv_stats.lock().await;
-                                    rs.packets_received += 1;
-                                    if pkt.sequence_number as u32 > rs.highest_seq {
-                                        rs.highest_seq = pkt.sequence_number as u32;
-                                    }
-                                    drop(rs);
-
-                                    let mut rssrc = remote_ssrc.lock().await;
-                                    if *rssrc == 0 {
-                                        *rssrc = pkt.ssrc;
-                                        tracing::info!(
-                                            "[{}] Remote audio SSRC: {:#010x}",
-                                            label,
-                                            pkt.ssrc
-                                        );
-                                    }
-                                    drop(rssrc);
-
-                                    // Dump raw PCMU payload to file (before decode)
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true).append(true)
-                                        .open("/tmp/received_audio.ulaw")
-                                    {
-                                        use std::io::Write;
-                                        let _ = f.write_all(&pkt.payload);
-                                    }
-
-                                    // Decode PCMU to linear PCM
-                                    let samples: Vec<i16> = pkt
-                                        .payload
-                                        .iter()
-                                        .map(|&b| rtp::ulaw_to_linear(b))
-                                        .collect();
-
-                                    // Record for echo detection (outgoing leg)
-                                    if let Some(ref rec) = recorder {
-                                        let mut rec = rec.lock().await;
-                                        rec.push_frame(&samples);
-                                    }
-
-                                    // Feed speaker output (non-blocking)
-                                    if let Some(ref tx) = speaker_tx {
-                                        match tx.try_send(samples.clone()) {
-                                            Ok(()) => {}
-                                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                                tracing::debug!("[{}] Speaker channel full, dropping frame", label);
-                                            }
-                                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                                tracing::warn!("[{}] Speaker channel disconnected!", label);
-                                            }
-                                        }
-                                    }
-
-                                    // Feed loopback channel (incoming leg)
-                                    if let Some(ref tx) = loopback_tx {
-                                        // Drop frames if channel is full (non-blocking)
-                                        let _ = tx.try_send(samples);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                tracing::trace!(
-                                    "[{}] Cannot decrypt from {} ({} bytes)",
-                                    label,
-                                    from,
-                                    len
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("[{}] UDP recv error: {:#}", label, e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }));
-    }
-
-    // RTCP send loop
-    {
-        let socket = leg.audio_socket.clone();
-        let srtp_ctx = leg.audio_srtp_ctx.clone();
-        let send_stats = send_stats.clone();
-        let recv_stats = recv_stats.clone();
-        let remote_ssrc = remote_ssrc.clone();
-        let dynamic_remote = dynamic_remote_addr.clone();
-        let cname = cname.to_string();
-        let label = label.clone();
-        handles.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let ss = send_stats.lock().await;
-                let rs = recv_stats.lock().await;
-                let rssrc = *remote_ssrc.lock().await;
-
-                let rtcp_packet = if ss.packets_sent > 0 {
-                    rtcp::build_sender_report(&ss, &rs, rssrc, &cname)
-                } else {
-                    rtcp::build_receiver_report(ss.ssrc, &rs, rssrc, &cname)
-                };
-                drop(ss);
-                drop(rs);
-
-                let mut ctx = srtp_ctx.lock().await;
-                match srtp::protect_rtcp(&mut ctx, &rtcp_packet) {
-                    Ok(srtcp) => {
-                        let remote_addr = *dynamic_remote.lock().await;
-                        if let Err(e) = socket.send_to(&srtcp, remote_addr).await {
-                            tracing::warn!("[{}] Failed to send SRTCP: {:#}", label, e);
-                        }
-                    }
-                    Err(e) => tracing::warn!("[{}] SRTCP protect failed: {:#}", label, e),
-                }
-            }
-        }));
-    }
-
-    // Video send loop
-    if let (Some(ref vid_srtp), Some(vid_addr)) = (&leg.video_srtp_ctx, leg.video_remote_addr) {
-        let socket = leg.video_socket.clone();
-        let vid_srtp = vid_srtp.clone();
-        let vid_send_stats = video_send_stats.clone();
-        let label = label.clone();
-
-        #[cfg(feature = "video-capture")]
-        let camera_rx = leg.camera_rx.take();
-        #[cfg(not(feature = "video-capture"))]
-        let camera_rx: Option<()> = None;
-
-        handles.push(tokio::spawn(async move {
-            let mut packetizer = video::VideoPacketizer::new(video_ssrc);
-            let mut interval =
-                tokio::time::interval(Duration::from_millis(video::FRAME_INTERVAL_MS));
-
-            #[cfg(feature = "video-capture")]
-            let mut encoder = camera_rx.as_ref().and_then(|_| {
-                match codec::H264Encoder::new(320, 240, 15.0, 256) {
-                    Ok(enc) => {
-                        tracing::info!("[{}] H.264 encoder initialized (320x240, 256kbps)", label);
-                        Some(enc)
-                    }
-                    Err(e) => {
-                        tracing::warn!("[{}] Failed to create H.264 encoder: {:#}", label, e);
-                        None
-                    }
-                }
-            });
-
-            tracing::info!(
-                "[{}] Video send loop started (SSRC: {:#010x}, camera: {})",
-                label,
-                video_ssrc,
-                if camera_rx.is_some() { "live" } else { "black" },
-            );
-
-            loop {
-                interval.tick().await;
-
-                // Try camera frame, fall back to black iframe
-                let nal_units = {
-                    #[cfg(feature = "video-capture")]
-                    {
-                        if let (Some(ref rx), Some(ref mut enc)) = (&camera_rx, &mut encoder) {
-                            match rx.try_recv() {
-                                Ok(frame) if frame.width > 0 => match enc.encode(&frame.data) {
-                                    Ok(nals) if !nals.is_empty() => nals,
-                                    Ok(_) => video::generate_black_iframe(),
-                                    Err(e) => {
-                                        tracing::debug!("[{}] Encode error: {:#}", label, e);
-                                        video::generate_black_iframe()
-                                    }
-                                },
-                                _ => video::generate_black_iframe(),
-                            }
-                        } else {
-                            video::generate_black_iframe()
-                        }
-                    }
-                    #[cfg(not(feature = "video-capture"))]
-                    {
-                        let _ = &camera_rx;
-                        video::generate_black_iframe()
-                    }
-                };
-
-                let rtp_packets = packetizer.packetize_frame(&nal_units);
-
-                for rtp_pkt in &rtp_packets {
-                    let payload_len = rtp_pkt.len().saturating_sub(rtp::RTP_HEADER_SIZE);
-                    let last_ts = if rtp_pkt.len() >= 8 {
-                        u32::from_be_bytes([rtp_pkt[4], rtp_pkt[5], rtp_pkt[6], rtp_pkt[7]])
-                    } else {
-                        0
-                    };
-                    let srtp_packet = {
-                        let mut ctx = vid_srtp.lock().await;
-                        match srtp::protect(&mut ctx, rtp_pkt) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::warn!("[{}] Video SRTP protect: {:#}", label, e);
-                                continue;
-                            }
-                        }
-                    };
-                    if socket.send_to(&srtp_packet, vid_addr).await.is_ok() {
-                        let mut s = vid_send_stats.lock().await;
-                        s.packets_sent += 1;
-                        s.bytes_sent += payload_len as u32;
-                        s.last_rtp_timestamp = last_ts;
-                    }
-                }
-            }
-        }));
-    }
-
-    // Video recv loop
-    if let (Some(ref vid_srtp), Some(_)) = (&leg.video_srtp_ctx, leg.video_remote_addr) {
-        let socket = leg.video_socket.clone();
-        let vid_srtp = vid_srtp.clone();
-        let vid_recv_stats = video_recv_stats.clone();
-        let vid_remote_ssrc = video_remote_ssrc.clone();
-        let vid_local_pwd = leg.video_local_pwd.clone();
-        let label = label.clone();
-
-        #[cfg(feature = "video-capture")]
-        let display_tx = leg.display_tx.take();
-
-        handles.push(tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            let mut depacketizer = video::VideoDepacketizer::new();
-
-            #[cfg(feature = "video-capture")]
-            let mut decoder = display_tx
-                .as_ref()
-                .and_then(|_| match codec::H264Decoder::new() {
-                    Ok(dec) => {
-                        tracing::info!("[{}] H.264 decoder initialized for display", label);
-                        Some(dec)
-                    }
-                    Err(e) => {
-                        tracing::warn!("[{}] Failed to create H.264 decoder: {:#}", label, e);
-                        None
-                    }
-                });
-
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, from)) => {
-                        let data = &buf[..len];
-
-                        if len >= 20 && ice::is_stun_message(data) {
-                            if ice::is_stun_request(data) {
-                                if let Some(txn_id) = ice::get_transaction_id(data) {
-                                    let resp = ice::build_binding_response(
-                                        &txn_id,
-                                        from,
-                                        Some(vid_local_pwd.as_bytes()),
-                                    );
-                                    let _ = socket.send_to(&resp, from).await;
-                                }
-                            }
-                            continue;
-                        }
-
-                        // Try SRTCP unprotect first
-                        let srtcp_result = {
-                            let mut ctx = vid_srtp.lock().await;
-                            srtp::unprotect_rtcp(&mut ctx, data).ok()
-                        };
-                        if let Some(rtcp_data) = srtcp_result {
-                            tracing::debug!(
-                                "[{}] Received video SRTCP ({} bytes)",
-                                label,
-                                rtcp_data.len()
-                            );
-                            let blocks = rtcp::parse_rtcp(&rtcp_data);
-                            let mut rs = vid_recv_stats.lock().await;
-                            for block in &blocks {
-                                if let rtcp::RtcpBlock::SenderReport { ntp_timestamp, .. } = block {
-                                    rs.last_sr_ntp = ((*ntp_timestamp >> 16) & 0xFFFF_FFFF) as u32;
-                                    rs.last_sr_recv_time = Some(std::time::Instant::now());
-                                }
-                            }
-                            continue;
-                        }
-
-                        let result = {
-                            let mut ctx = vid_srtp.lock().await;
-                            srtp::unprotect(&mut ctx, data)
-                        };
-                        match result {
-                            Ok(rtp_data) => {
-                                if let Ok(pkt) = rtp::decode(&rtp_data) {
-                                    let mut rs = vid_recv_stats.lock().await;
-                                    rs.packets_received += 1;
-                                    if pkt.sequence_number as u32 > rs.highest_seq {
-                                        rs.highest_seq = pkt.sequence_number as u32;
-                                    }
-                                    drop(rs);
-
-                                    let mut rssrc = vid_remote_ssrc.lock().await;
-                                    if *rssrc == 0 {
-                                        *rssrc = pkt.ssrc;
-                                        tracing::info!(
-                                            "[{}] Remote video SSRC: {:#010x}",
-                                            label,
-                                            pkt.ssrc
-                                        );
-                                    }
-                                    drop(rssrc);
-
-                                    // Depacketize and optionally decode + display
-                                    let marker = pkt.marker;
-                                    match depacketizer.depacketize(&pkt.payload, marker) {
-                                        Ok(Some(nal)) => {
-                                            #[cfg(feature = "video-capture")]
-                                            if let (Some(ref mut dec), Some(ref tx)) =
-                                                (&mut decoder, &display_tx)
-                                            {
-                                                match dec.decode(&nal) {
-                                                    Ok(Some(frame)) => {
-                                                        let _ =
-                                                            tx.try_send(display::DisplayFrame {
-                                                                width: frame.width,
-                                                                height: frame.height,
-                                                                data: frame.data,
-                                                            });
-                                                    }
-                                                    Ok(None) => {} // decoder needs more data
-                                                    Err(e) => {
-                                                        tracing::debug!(
-                                                            "[{}] Decode error: {:#}",
-                                                            label,
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => {} // more fragments needed
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "[{}] Depacketize error: {:#}",
-                                                label,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                tracing::trace!(
-                                    "[{}] Cannot decrypt video from {} ({} bytes)",
-                                    label,
-                                    from,
-                                    len
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("[{}] Video UDP recv error: {:#}", label, e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }));
-    }
-
-    // Video RTCP send loop
-    if let (Some(ref vid_srtp), Some(vid_addr)) = (&leg.video_srtp_ctx, leg.video_remote_addr) {
-        let socket = leg.video_socket.clone();
-        let vid_srtp = vid_srtp.clone();
-        let vid_send_stats = video_send_stats.clone();
-        let vid_recv_stats = video_recv_stats.clone();
-        let vid_remote_ssrc = video_remote_ssrc.clone();
-        let cname = cname.to_string();
-        let label = label.clone();
-        handles.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let ss = vid_send_stats.lock().await;
-                let rs = vid_recv_stats.lock().await;
-                let rssrc = *vid_remote_ssrc.lock().await;
-
-                let rtcp_packet = if ss.packets_sent > 0 {
-                    rtcp::build_sender_report(&ss, &rs, rssrc, &cname)
-                } else {
-                    rtcp::build_receiver_report(ss.ssrc, &rs, rssrc, &cname)
-                };
-                drop(ss);
-                drop(rs);
-
-                let mut ctx = vid_srtp.lock().await;
-                match srtp::protect_rtcp(&mut ctx, &rtcp_packet) {
-                    Ok(srtcp) => {
-                        if let Err(e) = socket.send_to(&srtcp, vid_addr).await {
-                            tracing::warn!("[{}] Failed to send video SRTCP: {:#}", label, e);
-                        }
-                    }
-                    Err(e) => tracing::warn!("[{}] Video SRTCP protect failed: {:#}", label, e),
-                }
-            }
-        }));
-    }
-
-    MediaLegHandles {
-        send_stats,
-        recv_stats,
-        video_send_stats,
-        video_recv_stats,
-        handles,
-    }
-}
-
-/// Response from Trouter when call is accepted.
-#[derive(Debug)]
-struct CallAcceptanceResponse {
-    sdp_blob: Option<String>,
-    end_url: Option<String>,
-    rejection_reason: Option<String>,
-    /// URL to POST acknowledgement to (keeps call alive).
-    acknowledgement_url: Option<String>,
-    /// URL for the active call leg (used for CC callback registration).
-    call_leg_url: Option<String>,
-    /// URL for applying channel parameters (video send caps). Used later for video setup.
-    #[allow(dead_code)]
-    apply_channel_params_url: Option<String>,
-}
-
-/// Check a parsed JSON value for callEnd and return a descriptive string.
-fn check_call_end(v: &serde_json::Value) -> Option<String> {
-    let call_end = v.get("callEnd")?;
-    let code = call_end.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
-    let sub_code = call_end
-        .get("subCode")
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0);
-    let phrase = call_end
-        .get("phrase")
-        .and_then(|s| s.as_str())
-        .unwrap_or("unknown");
-    let reason = call_end
-        .get("reason")
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
-    let result_cat = call_end
-        .get("resultCategories")
-        .and_then(|r| {
-            if let Some(arr) = r.as_array() {
-                Some(
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                )
-            } else {
-                r.as_str().map(|s| s.to_string())
-            }
-        })
-        .unwrap_or_default();
-    Some(format!(
-        "Call ended: {} (code={}, subCode={}, reason={}, categories={})",
-        phrase, code, sub_code, reason, result_cat
-    ))
-}
-
-/// Check a parsed JSON value for sessionRejection and return a descriptive string.
-fn check_session_rejection(v: &serde_json::Value) -> Option<String> {
-    let rejection = v.get("sessionRejection")?;
-    tracing::debug!(
-        "Full sessionRejection: {}",
-        serde_json::to_string_pretty(rejection).unwrap_or_default()
-    );
-    let code = rejection.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
-    let sub_code = rejection
-        .get("subCode")
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0);
-    let phrase = rejection
-        .get("phrase")
-        .and_then(|s| s.as_str())
-        .unwrap_or("unknown");
-    // Include resultCategories and diagnosticContext if present
-    let result_cat = rejection
-        .get("resultCategories")
-        .and_then(|r| r.as_str())
-        .unwrap_or("");
-    let diag = rejection
-        .get("diagnosticContext")
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
-    let mut msg = format!(
-        "Call rejected: {} (code={}, subCode={})",
-        phrase, code, sub_code
-    );
-    if !result_cat.is_empty() {
-        msg.push_str(&format!(" resultCategories={}", result_cat));
-    }
-    if !diag.is_empty() {
-        msg.push_str(&format!(" diag={}", diag));
-    }
-    Some(msg)
-}
-
-/// Try to extract a call-relevant JSON payload from a frame.
-///
-/// For 3::: frames the payload is wrapped: `3:::{"id":N,"data":{"body":"{...}"}}`
-/// where body is stringified JSON. For 5::: frames the JSON is direct.
-pub fn extract_call_payload(frame: &str) -> Option<serde_json::Value> {
-    let json_str = extract_json_from_frame(frame)?;
-    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
-
-    // Check if body is gzip-compressed
-    let is_gzip = v
-        .pointer("/headers/X-Microsoft-Skype-Content-Encoding")
-        .and_then(|h| h.as_str())
-        .map(|h| h.eq_ignore_ascii_case("gzip"))
-        .unwrap_or(false);
-
-    // 3::: format: body may be at /body or /data/body depending on Trouter version
-    if frame.starts_with("3:::") || frame.starts_with("3::") {
-        for path in &["/body", "/data/body"] {
-            if let Some(body_str) = v.pointer(path).and_then(|b| b.as_str()) {
-                // If gzip, decode base64 then decompress
-                if is_gzip {
-                    if let Some(decompressed) = decompress_gzip_base64(body_str) {
-                        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&decompressed)
-                        {
-                            return Some(inner);
-                        }
-                    }
-                }
-                // Try as plain JSON string
-                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(body_str) {
-                    return Some(inner);
-                }
-            }
-            if let Some(body_obj) = v.pointer(path) {
-                if body_obj.is_object() {
-                    return Some(body_obj.clone());
-                }
-            }
-        }
-    }
-
-    // 5::: or fallback: use the JSON directly
-    Some(v)
-}
-
-/// Decode base64 then decompress gzip data.
-fn decompress_gzip_base64(b64: &str) -> Option<String> {
-    use std::io::Read as _;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut output = String::new();
-    decoder.read_to_string(&mut output).ok()?;
-    Some(output)
-}
-
-/// Wait on the Trouter WebSocket for a media answer or call acceptance event.
-///
-/// For channel calls via the conversation API, we expect a mediaAnswer callback
-/// on our Trouter path with the remote SDP. We also handle sessionRejection.
-async fn wait_for_call_acceptance(
-    ws: &mut websocket::TrouterSocket,
-    timeout: Duration,
-) -> Result<CallAcceptanceResponse> {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        tokio::select! {
-            frame = ws.recv_frame() => {
-                match frame? {
-                    Some(text) => {
-                        // Respond to heartbeats
-                        if text.starts_with("2::") {
-                            ws.send_text("2::").await.ok();
-                            continue;
-                        }
-
-                        // Log all non-heartbeat frames for debugging
-                        let truncated: String = text.chars().take(300).collect();
-                        tracing::info!("Trouter frame: {}", truncated);
-
-                        // Extract call payload (handles both 3::: and 5::: formats)
-                        if let Some(v) = extract_call_payload(&text) {
-                            tracing::debug!("Extracted call payload: {}", serde_json::to_string_pretty(&v).unwrap_or_default());
-
-                            // Log bodies of important frames for debugging
-                            if text.contains("call/end") || text.contains("conversationEnd") || text.contains("conversationUpdate") {
-                                tracing::info!("Frame body [{}]: {}",
-                                    if text.contains("call/end") { "call/end" }
-                                    else if text.contains("conversationEnd") { "conversationEnd" }
-                                    else { "conversationUpdate" },
-                                    serde_json::to_string(&v).unwrap_or_default());
-                            }
-
-                            // Check for sessionRejection
-                            if let Some(reason) = check_session_rejection(&v) {
-                                tracing::warn!("{}", reason);
-                                return Ok(CallAcceptanceResponse {
-                                    sdp_blob: None,
-                                    end_url: None,
-                                    rejection_reason: Some(reason),
-                                    acknowledgement_url: None,
-                                    call_leg_url: None,
-                                    apply_channel_params_url: None,
-                                });
-                            }
-
-                            // Check for callEnd (server-side call termination)
-                            if let Some(reason) = check_call_end(&v) {
-                                tracing::warn!("{}", reason);
-                                return Ok(CallAcceptanceResponse {
-                                    sdp_blob: None,
-                                    end_url: None,
-                                    rejection_reason: Some(reason),
-                                    acknowledgement_url: None,
-                                    call_leg_url: None,
-                                    apply_channel_params_url: None,
-                                });
-                            }
-
-                            // Check for mediaAnswer or callAcceptance with SDP
-                            if let Some(blob) = v.pointer("/callAcceptance/mediaContent/blob")
-                                .or_else(|| v.pointer("/mediaContent/blob"))
-                                .or_else(|| v.pointer("/mediaAnswer/mediaContent/blob"))
-                                .and_then(|b| b.as_str())
-                            {
-                                let links_base = if v.get("callAcceptance").is_some() {
-                                    "/callAcceptance/links"
-                                } else {
-                                    "/links"
-                                };
-                                let get_link = |name: &str| -> Option<String> {
-                                    v.pointer(&format!("{}/{}", links_base, name))
-                                        .and_then(|u| u.as_str())
-                                        .map(|s| s.to_string())
-                                };
-
-                                let end_url = get_link("end");
-                                let acknowledgement_url = get_link("acknowledgement");
-                                let call_leg_url = get_link("callLeg");
-                                let apply_channel_params_url = get_link("applyChannelParameters");
-
-                                tracing::info!("Received media answer/acceptance with SDP ({} bytes)", blob.len());
-                                tracing::info!("  acknowledgement_url: {:?}", acknowledgement_url);
-                                tracing::info!("  call_leg_url: {:?}", call_leg_url);
-
-                                return Ok(CallAcceptanceResponse {
-                                    sdp_blob: Some(blob.to_string()),
-                                    end_url,
-                                    rejection_reason: None,
-                                    acknowledgement_url,
-                                    call_leg_url,
-                                    apply_channel_params_url,
-                                });
-                            }
-
-                            // Acceptance without SDP
-                            if v.get("callAcceptance").is_some() {
-                                tracing::warn!("Call accepted but no SDP in response");
-                                return Ok(CallAcceptanceResponse {
-                                    sdp_blob: None,
-                                    end_url: v.pointer("/callAcceptance/links/end")
-                                        .and_then(|u| u.as_str())
-                                        .map(|s| s.to_string()),
-                                    rejection_reason: Some("Call accepted without SDP — media setup impossible".to_string()),
-                                    acknowledgement_url: None,
-                                    call_leg_url: None,
-                                    apply_channel_params_url: None,
-                                });
-                            }
-                        }
-
-                        let dbg_trunc: String = text.chars().take(200).collect();
-                        tracing::debug!("Trouter frame (not call event): {}", dbg_trunc);
-                    }
-                    None => anyhow::bail!("WebSocket closed while waiting for acceptance"),
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                anyhow::bail!("Timeout waiting for call acceptance ({}s)", timeout.as_secs());
-            }
-        }
-    }
-}
-
-/// Extract JSON payload from a socket.io frame string.
-///
-/// Socket.io frames: "3:::{...}" or "5:::{...}". We anchor to the start
-/// to avoid matching `:::{` inside JSON body content.
-fn extract_json_from_frame(frame: &str) -> Option<&str> {
-    for prefix in &["3:::", "5:::", "3::", "5::"] {
-        if let Some(rest) = frame.strip_prefix(prefix) {
-            return Some(rest);
-        }
-    }
-    None
-}
-
-/// End a call by posting to a specific end URL.
-async fn end_call_by_url(http: &reqwest::Client, skype_token: &str, end_url: &str) -> Result<()> {
-    tracing::info!("Ending call -> POST {}", end_url);
-
-    let resp = http
-        .post(end_url)
-        .header("X-Skypetoken", skype_token)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .context("Failed to POST end call")?;
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    tracing::info!("Call ended ({}): {}", status, body);
-
-    Ok(())
-}
-
-/// Extract user MRI (e.g. "8:orgid:<guid>") from a Skype token.
-///
-/// Skype tokens are JWTs. The payload contains a "skypeid" claim like
-/// "orgid:<guid>" which we prefix with "8:" to form the MRI.
-fn extract_mri_from_skype_token(token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    // Decode JWT payload (base64url, no padding)
-    let payload = parts[1];
-    let padded = match payload.len() % 4 {
-        2 => format!("{}==", payload),
-        3 => format!("{}=", payload),
-        _ => payload.to_string(),
-    };
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(padded.trim_end_matches('='))
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-
-    // Try "skypeid" field first, then "oid" (Azure AD object ID)
-    if let Some(skypeid) = json.get("skypeid").and_then(|v| v.as_str()) {
-        // skypeid is like "orgid:<guid>" — prefix with "8:"
-        if skypeid.starts_with("orgid:") || skypeid.starts_with("teamsvisitor:") {
-            return Some(format!("8:{}", skypeid));
-        }
-        return Some(skypeid.to_string());
-    }
-
-    // Fallback: use oid claim
-    if let Some(oid) = json.get("oid").and_then(|v| v.as_str()) {
-        return Some(format!("8:orgid:{}", oid));
-    }
-
-    None
-}
-
-/// Extract the callee's OID from a 1:1 thread ID.
-///
-/// Thread format: `19:{oid1}_{oid2}@unq.gbl.spaces`
-/// Returns the OID that is NOT the caller's OID.
-fn extract_callee_oid_from_thread(thread_id: &str, caller_oid: &str) -> Option<String> {
-    // Strip prefix "19:" and suffix "@unq.gbl.spaces"
-    let inner = thread_id
-        .strip_prefix("19:")
-        .and_then(|s| s.strip_suffix("@unq.gbl.spaces"))?;
-
-    // Split by underscore to get the two OIDs
-    let parts: Vec<&str> = inner.split('_').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    // Return the OID that doesn't match the caller
-    if parts[0] == caller_oid {
-        Some(parts[1].to_string())
-    } else if parts[1] == caller_oid {
-        Some(parts[0].to_string())
-    } else {
-        // Neither OID matches the caller — unexpected but return first non-caller
-        tracing::warn!(
-            "Thread ID {} doesn't contain caller OID {}",
-            thread_id,
-            caller_oid
-        );
-        Some(parts[1].to_string())
-    }
-}
-
-/// Graph /me response (subset of fields we care about).
-#[derive(Debug, Deserialize)]
-struct MeResponse {
-    #[serde(rename = "displayName")]
-    display_name: Option<String>,
-    mail: Option<String>,
-}
-
-/// Fetch the authenticated user's profile from Graph /me.
-async fn fetch_me(http: &reqwest::Client, graph_token: &str) -> Result<MeResponse> {
-    let resp = http
-        .get("https://graph.microsoft.com/v1.0/me")
-        .bearer_auth(graph_token)
-        .send()
-        .await
-        .context("Failed to GET /me")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Graph /me returned {}: {}", status, body);
-    }
-    resp.json().await.context("Failed to parse /me response")
-}
-
-/// Write PCM i16 samples to a WAV file (mono, given sample rate).
-fn write_wav(path: &str, samples: &[i16], sample_rate: u32) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    let data_len = (samples.len() * 2) as u32;
-    let file_len = 36 + data_len;
-    // RIFF header
-    f.write_all(b"RIFF")?;
-    f.write_all(&file_len.to_le_bytes())?;
-    f.write_all(b"WAVE")?;
-    // fmt chunk
-    f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?; // chunk size
-    f.write_all(&1u16.to_le_bytes())?; // PCM format
-    f.write_all(&1u16.to_le_bytes())?; // mono
-    f.write_all(&sample_rate.to_le_bytes())?; // sample rate
-    let byte_rate = sample_rate * 2;
-    f.write_all(&byte_rate.to_le_bytes())?; // byte rate
-    f.write_all(&2u16.to_le_bytes())?; // block align
-    f.write_all(&16u16.to_le_bytes())?; // bits per sample
-                                        // data chunk
-    f.write_all(b"data")?;
-    f.write_all(&data_len.to_le_bytes())?;
-    for &s in samples {
-        f.write_all(&s.to_le_bytes())?;
-    }
-    Ok(())
 }

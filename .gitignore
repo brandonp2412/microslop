@@ -19,3 +19,7 @@ Thumbs.db
 .env
 *.local
 tmp/
+
+# Local browser and live-account E2E run logs
+/.chrome-*.log
+/.e2e-linux*.log

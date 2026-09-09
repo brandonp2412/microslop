@@ -10,53 +10,35 @@ use ratatui::{
 
 use crate::api;
 
-// ---------------------------------------------------------------------------
-// Data model
-// ---------------------------------------------------------------------------
-
-/// A channel inside a team.
 #[derive(Clone)]
 pub struct Channel {
     pub name: String,
-    /// The real channel/thread ID from the API.
     pub id: String,
-    /// Number of unread messages (0 = no badge)
     pub unread: u32,
 }
 
-/// A team containing channels.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct Team {
     pub name: String,
-    /// The real team ID from the API.
-    pub id: String,
     pub expanded: bool,
     pub channels: Vec<Channel>,
 }
 
-/// A direct-message contact.
 #[derive(Clone)]
 pub struct Chat {
     pub name: String,
-    /// The real chat/conversation thread ID from the API.
     pub id: String,
-    /// true = group chat (shows a different icon)
     pub is_group: bool,
     /// Number of unread messages (0 = no badge, use dot for "some")
     pub unread: u32,
-    /// Whether this contact is online (show presence dot)
-    pub online: bool,
 }
 
-/// Sidebar state: owns the data and tracks navigation.
 pub struct SidebarState {
     pub teams: Vec<Team>,
     pub chats: Vec<Chat>,
-    /// Index into the flat item list (0-based)
     pub selected: usize,
-    /// Whether data is still loading.
     pub loading: bool,
+    items: Vec<SidebarItem>,
 }
 
 impl Default for SidebarState {
@@ -66,18 +48,17 @@ impl Default for SidebarState {
             chats: Vec::new(),
             selected: 0,
             loading: true,
+            items: vec![SidebarItem::TeamsHeader, SidebarItem::ChatsHeader],
         }
     }
 }
 
 impl SidebarState {
-    /// Update teams data from API response.
     pub fn update_teams(&mut self, teams: Vec<api::TeamInfo>) {
         self.teams = teams
             .into_iter()
             .map(|t| Team {
                 name: t.name,
-                id: t.id,
                 expanded: true,
                 channels: t
                     .channels
@@ -90,10 +71,10 @@ impl SidebarState {
                     .collect(),
             })
             .collect();
+        self.rebuild_items();
         self.clamp_selection();
     }
 
-    /// Update chats data from API response.
     pub fn update_chats(&mut self, chats: Vec<api::ChatInfo>) {
         self.chats = chats
             .into_iter()
@@ -102,9 +83,9 @@ impl SidebarState {
                 id: c.id,
                 is_group: c.is_group,
                 unread: 0,
-                online: false,
             })
             .collect();
+        self.rebuild_items();
         self.clamp_selection();
     }
 
@@ -134,58 +115,42 @@ impl SidebarState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Flat item enumeration
-// ---------------------------------------------------------------------------
-
-/// One row in the sidebar's flat list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarItem {
-    /// "TEAMS" section header (not selectable, but occupies a row)
     TeamsHeader,
-    /// A team row (index into SidebarState.teams)
     Team(usize),
-    /// A channel row (team_idx, channel_idx)
     Channel(usize, usize),
-    /// "CHATS" separator
     ChatsHeader,
-    /// A chat row (index into SidebarState.chats)
     Chat(usize),
 }
 
 impl SidebarState {
-    /// Build a flat list of items in display order.
-    pub fn flat_items(&self) -> Vec<SidebarItem> {
-        let mut items = Vec::new();
+    pub fn flat_items(&self) -> &[SidebarItem] {
+        &self.items
+    }
 
-        // Teams header
-        items.push(SidebarItem::TeamsHeader);
-
+    fn rebuild_items(&mut self) {
+        let mut items = vec![SidebarItem::TeamsHeader];
         for (ti, team) in self.teams.iter().enumerate() {
             items.push(SidebarItem::Team(ti));
             if team.expanded {
-                for (ci, _ch) in team.channels.iter().enumerate() {
-                    items.push(SidebarItem::Channel(ti, ci));
-                }
+                items.extend(
+                    team.channels
+                        .iter()
+                        .enumerate()
+                        .map(|(ci, _)| SidebarItem::Channel(ti, ci)),
+                );
             }
         }
-
-        // Chats separator
         items.push(SidebarItem::ChatsHeader);
-
-        for (ci, _chat) in self.chats.iter().enumerate() {
-            items.push(SidebarItem::Chat(ci));
-        }
-
-        items
+        items.extend((0..self.chats.len()).map(SidebarItem::Chat));
+        self.items = items;
     }
 
-    /// Total number of flat items.
     pub fn item_count(&self) -> usize {
-        self.flat_items().len()
+        self.items.len()
     }
 
-    /// Move selection up.
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
@@ -193,7 +158,6 @@ impl SidebarState {
         }
     }
 
-    /// Move selection down.
     pub fn move_down(&mut self) {
         let count = self.item_count();
         if count == 0 {
@@ -207,25 +171,31 @@ impl SidebarState {
 
     /// Toggle expand/collapse if current selection is a Team row.
     pub fn toggle_expand(&mut self) {
-        let items = self.flat_items();
-        if let Some(SidebarItem::Team(ti)) = items.get(self.selected) {
-            self.teams[*ti].expanded = !self.teams[*ti].expanded;
+        if let Some(SidebarItem::Team(ti)) = self.items.get(self.selected).copied() {
+            self.teams[ti].expanded = !self.teams[ti].expanded;
+            self.rebuild_items();
+        }
+    }
+
+    pub fn expand_team(&mut self, team: usize) {
+        if !self.teams[team].expanded {
+            self.teams[team].expanded = true;
+            self.rebuild_items();
         }
     }
 
     /// Skip non-selectable headers when moving up.
     fn skip_headers_up(&mut self) {
-        let items = self.flat_items();
         while self.selected > 0 {
-            match items.get(self.selected) {
+            match self.items.get(self.selected) {
                 Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) => {
                     self.selected -= 1;
                 }
                 _ => break,
             }
         }
-        // If we landed on TeamsHeader (index 0), move down instead
-        if let Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) = items.get(self.selected)
+        if let Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) =
+            self.items.get(self.selected)
         {
             self.skip_headers_down();
         }
@@ -233,10 +203,9 @@ impl SidebarState {
 
     /// Skip non-selectable headers when moving down.
     fn skip_headers_down(&mut self) {
-        let items = self.flat_items();
-        let count = items.len();
+        let count = self.items.len();
         while self.selected < count - 1 {
-            match items.get(self.selected) {
+            match self.items.get(self.selected) {
                 Some(SidebarItem::TeamsHeader | SidebarItem::ChatsHeader) => {
                     self.selected += 1;
                 }
@@ -260,11 +229,6 @@ impl SidebarState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
-/// Render the sidebar into the given area.
 pub fn render(area: Rect, buf: &mut Buffer, state: &SidebarState, focused: bool) {
     let border_style = if focused {
         Style::default().fg(Color::Yellow)
@@ -286,7 +250,6 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &SidebarState, focused: bool)
     let inner = block.inner(area);
     block.render(area, buf);
 
-    // Show loading indicator if data hasn't arrived yet.
     if state.loading && state.teams.is_empty() && state.chats.is_empty() {
         if inner.height > 0 && inner.width > 0 {
             let loading_area = Rect::new(inner.x, inner.y, inner.width, 1);
@@ -306,7 +269,6 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &SidebarState, focused: bool)
         return;
     }
 
-    // Compute scroll offset so selected item is visible.
     let scroll_offset = compute_scroll_offset(state.selected, available_height, items.len());
 
     for (row_idx, item_idx) in (scroll_offset..items.len())
@@ -337,7 +299,6 @@ fn compute_scroll_offset(selected: usize, height: usize, total: usize) -> usize 
     offset.min(max_offset)
 }
 
-/// Rendering context for a single sidebar row.
 struct RowCtx {
     area: Rect,
     selected: bool,
@@ -360,7 +321,6 @@ fn item_style(selected: bool, has_unread: bool) -> Style {
     }
 }
 
-/// Style for a badge (unread count) based on selection state.
 fn badge_style(selected: bool) -> Style {
     if selected {
         Style::default()
@@ -374,7 +334,6 @@ fn badge_style(selected: bool) -> Style {
     }
 }
 
-/// Render a single sidebar item into the buffer.
 fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &SidebarState) {
     let w = ctx.area.width as usize;
     match item {
@@ -433,7 +392,6 @@ fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &Sideb
         }
 
         SidebarItem::ChatsHeader => {
-            // Render a separator line: " -- CHATS --------"
             let prefix = " -- CHATS ";
             let dashes = w.saturating_sub(prefix.len());
             let label = format!("{}{}", prefix, "-".repeat(dashes));
@@ -452,8 +410,6 @@ fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &Sideb
             let label = format!("{}{} {}", cursor, icon, chat.name);
             let badge = if chat.unread > 0 {
                 format!("{}", chat.unread)
-            } else if chat.online {
-                "*".to_string()
             } else {
                 String::new()
             };
@@ -461,8 +417,6 @@ fn render_item(buf: &mut Buffer, ctx: &RowCtx, item: &SidebarItem, state: &Sideb
             let style = item_style(ctx.selected, chat.unread > 0);
             let bstyle = if chat.unread > 0 {
                 badge_style(ctx.selected)
-            } else if chat.online {
-                Style::default().fg(Color::Green)
             } else {
                 style
             };
@@ -486,7 +440,6 @@ fn render_row(
         return;
     }
 
-    // Truncate left text if needed, leaving room for badge + 1 space
     let badge_w = unicode_width::UnicodeWidthStr::width(badge);
     let max_left = if badge_w > 0 {
         width.saturating_sub(badge_w + 1)
@@ -494,7 +447,6 @@ fn render_row(
         width
     };
 
-    // Truncate by display width, not char count
     let mut left_truncated = String::new();
     let mut left_w = 0;
     for ch in left.chars() {
@@ -506,14 +458,12 @@ fn render_row(
         left_w += cw;
     }
 
-    // Padding between left text and badge
     let pad = if badge_w > 0 {
         width.saturating_sub(left_w + badge_w)
     } else {
         width.saturating_sub(left_w)
     };
 
-    // Build the line
     let line = Line::from(vec![
         Span::styled(left_truncated, text_style),
         Span::styled(" ".repeat(pad), text_style),

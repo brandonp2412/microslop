@@ -14,7 +14,6 @@ use super::search::SearchState;
 use super::sidebar::SidebarState;
 use super::ui;
 
-/// Active pane in the TUI
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     #[default]
@@ -33,44 +32,42 @@ impl Pane {
     }
 }
 
-/// Application state
 pub struct App {
-    /// Whether the app should exit
     pub should_exit: bool,
-    /// Online status (for display)
     pub is_online: bool,
-    /// Current user name
     pub user_name: String,
-    /// Current channel name
     pub channel_name: String,
-    /// Member count
-    #[allow(dead_code)]
-    pub member_count: u32,
-    /// Connection state description
     pub connection_state: String,
-    /// Active pane
     pub active_pane: Pane,
-    /// Sidebar state (teams/channels/chats + navigation)
     pub sidebar: SidebarState,
-    /// Messages pane state
     pub messages: MessagesState,
-    /// Compose box state
     pub compose: ComposeState,
     /// Whether the help popup is visible
     pub show_help: bool,
-    /// Global search overlay state
     pub search: SearchState,
-    /// The chat/channel ID currently being viewed.
     pub current_chat_id: Option<String>,
-    /// Status message shown in the status bar (errors, info).
     pub status_message: Option<String>,
-    /// Whether the status message is an error.
     pub status_is_error: bool,
-    /// Debug log pane state.
     pub debug_log: DebugLogState,
 }
 
 impl App {
+    fn prefetch_sidebar_messages(&self, backend: &Backend) {
+        let channel_ids = self
+            .sidebar
+            .teams
+            .iter()
+            .flat_map(|team| team.channels.iter().map(|channel| channel.id.as_str()));
+        let chat_ids = self.sidebar.chats.iter().map(|chat| chat.id.as_str());
+        let ids = super::backend::prefetch_ids(channel_ids, chat_ids);
+        if !ids.is_empty() {
+            backend.send(BackendCommand::PrefetchMessages {
+                chat_ids: ids,
+                limit: 50,
+            });
+        }
+    }
+
     /// Create a new App with the given log buffer for debug log capture.
     pub fn new(log_buffer: LogBuffer) -> Self {
         Self {
@@ -78,7 +75,6 @@ impl App {
             is_online: false,
             user_name: "Loading...".to_string(),
             channel_name: "".to_string(),
-            member_count: 0,
             connection_state: "Connecting...".to_string(),
             active_pane: Pane::default(),
             sidebar: SidebarState::default(),
@@ -95,7 +91,6 @@ impl App {
 }
 
 impl App {
-    /// Cycle to the next pane.
     fn next_pane(&mut self) {
         self.active_pane = match self.active_pane {
             Pane::Sidebar => Pane::Messages,
@@ -104,7 +99,6 @@ impl App {
         };
     }
 
-    /// Cycle to the previous pane (reverse of next_pane).
     fn prev_pane(&mut self) {
         self.active_pane = match self.active_pane {
             Pane::Sidebar => Pane::Compose,
@@ -113,29 +107,24 @@ impl App {
         };
     }
 
-    /// Handle a crossterm event.
     pub fn handle_event(&mut self, event: Event, backend: &Backend) {
         if let Event::Key(key_event) = event {
             if key_event.kind != KeyEventKind::Press {
                 return;
             }
 
-            // When help popup is visible, any key closes it.
             if self.show_help {
                 self.show_help = false;
                 return;
             }
 
-            // Clear status message on any keypress.
             self.status_message = None;
 
-            // When search overlay is active, route all keys to search handler.
             if self.search.active {
                 self.handle_search_key(key_event);
                 return;
             }
 
-            // Ctrl+K activates global search from any mode.
             if key_event.code == KeyCode::Char('k')
                 && key_event.modifiers.contains(KeyModifiers::CONTROL)
             {
@@ -143,7 +132,6 @@ impl App {
                 return;
             }
 
-            // Ctrl+D toggles debug log pane from any mode.
             if key_event.code == KeyCode::Char('d')
                 && key_event.modifiers.contains(KeyModifiers::CONTROL)
             {
@@ -151,9 +139,17 @@ impl App {
                 return;
             }
 
-            // When debug log is visible, handle scroll keys.
             if self.debug_log.visible {
                 match key_event.code {
+                    KeyCode::Char('c') => {
+                        self.status_is_error = self.debug_log.copy_to_clipboard().is_err();
+                        self.status_message = Some(if self.status_is_error {
+                            "Could not copy debug log to clipboard".to_string()
+                        } else {
+                            "Debug log copied to clipboard".to_string()
+                        });
+                        return;
+                    }
                     KeyCode::PageUp => {
                         self.debug_log.scroll_up(10);
                         return;
@@ -166,7 +162,6 @@ impl App {
                 }
             }
 
-            // When the compose pane is focused, most keys are text input.
             if self.active_pane == Pane::Compose {
                 self.handle_compose_key(key_event, backend);
             } else {
@@ -193,7 +188,6 @@ impl App {
             KeyCode::Left => {
                 self.prev_pane();
             }
-            // Direct pane jump with number keys
             KeyCode::Char('1') => {
                 self.active_pane = Pane::Sidebar;
             }
@@ -203,7 +197,6 @@ impl App {
             KeyCode::Char('3') => {
                 self.active_pane = Pane::Compose;
             }
-            // Sidebar-specific keys (only when sidebar is focused)
             KeyCode::Up | KeyCode::Char('k') if self.active_pane == Pane::Sidebar => {
                 self.sidebar.move_up();
             }
@@ -213,7 +206,6 @@ impl App {
             KeyCode::Enter if self.active_pane == Pane::Sidebar => {
                 self.handle_sidebar_enter(backend);
             }
-            // Messages pane keys
             KeyCode::Up | KeyCode::Char('k') if self.active_pane == Pane::Messages => {
                 self.messages.select_previous();
             }
@@ -223,7 +215,6 @@ impl App {
             KeyCode::Enter if self.active_pane == Pane::Messages => {
                 self.messages.toggle_thread();
             }
-            // Help popup toggle (available from any non-compose pane)
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
             }
@@ -231,7 +222,6 @@ impl App {
         }
     }
 
-    /// Handle Enter key on a sidebar item.
     ///
     /// If the selected item is a team, toggle expand/collapse.
     /// If it's a channel or chat, load its messages.
@@ -271,23 +261,18 @@ impl App {
         let code = key_event.code;
 
         match (code, modifiers) {
-            // Tab always cycles pane focus.
             (KeyCode::Tab, _) => {
                 self.next_pane();
             }
-            // Shift+Tab cycles backward.
             (KeyCode::BackTab, _) => {
                 self.prev_pane();
             }
-            // Esc leaves compose and goes to Messages pane.
             (KeyCode::Esc, _) => {
                 self.active_pane = Pane::Messages;
             }
-            // Ctrl+Enter inserts a newline.
             (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
                 self.compose.insert_newline();
             }
-            // Enter sends the message.
             (KeyCode::Enter, _) => {
                 if let Some(text) = self.compose.send() {
                     if let Some(ref chat_id) = self.current_chat_id {
@@ -302,19 +287,15 @@ impl App {
                     }
                 }
             }
-            // Ctrl+U clears the compose box.
             (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.compose.clear();
             }
-            // Backspace deletes character before cursor.
             (KeyCode::Backspace, _) => {
                 self.compose.backspace();
             }
-            // Delete removes character at cursor.
             (KeyCode::Delete, _) => {
                 self.compose.delete();
             }
-            // Arrow keys for cursor movement.
             (KeyCode::Left, _) => {
                 self.compose.move_left();
             }
@@ -327,12 +308,8 @@ impl App {
             (KeyCode::End, _) => {
                 self.compose.move_end();
             }
-            // Regular character input.
-            (KeyCode::Char(c), m) => {
-                // Only insert if no modifiers or just shift (for uppercase).
-                if m.is_empty() || m == KeyModifiers::SHIFT {
-                    self.compose.insert_char(c);
-                }
+            (KeyCode::Char(c), m) if (m.is_empty() || m == KeyModifiers::SHIFT) => {
+                self.compose.insert_char(c);
             }
             _ => {}
         }
@@ -344,33 +321,26 @@ impl App {
         let modifiers = key_event.modifiers;
 
         match (code, modifiers) {
-            // Esc closes the search overlay.
             (KeyCode::Esc, _) => {
                 self.search.deactivate();
             }
-            // Up arrow navigates results.
             (KeyCode::Up, _) => {
                 self.search.select_previous();
             }
-            // Down arrow navigates results.
             (KeyCode::Down, _) => {
                 self.search.select_next();
             }
-            // Enter selects the current result.
             (KeyCode::Enter, _) => {
                 self.apply_search_selection();
             }
-            // Backspace deletes character before cursor.
             (KeyCode::Backspace, _) => {
                 self.search.backspace();
                 self.search.update_results(&self.sidebar, &self.messages);
             }
-            // Delete removes character at cursor.
             (KeyCode::Delete, _) => {
                 self.search.delete_at_cursor();
                 self.search.update_results(&self.sidebar, &self.messages);
             }
-            // Left/Right move cursor.
             (KeyCode::Left, _) => {
                 self.search.move_left();
             }
@@ -383,13 +353,9 @@ impl App {
             (KeyCode::End, _) => {
                 self.search.move_end();
             }
-            // Regular character input.
-            (KeyCode::Char(c), m) => {
-                // Only insert if no modifiers or just shift (for uppercase).
-                if m.is_empty() || m == KeyModifiers::SHIFT {
-                    self.search.insert_char(c);
-                    self.search.update_results(&self.sidebar, &self.messages);
-                }
+            (KeyCode::Char(c), m) if (m.is_empty() || m == KeyModifiers::SHIFT) => {
+                self.search.insert_char(c);
+                self.search.update_results(&self.sidebar, &self.messages);
             }
             _ => {}
         }
@@ -409,11 +375,7 @@ impl App {
 
         match result {
             SearchResultKind::Channel(team_idx, channel_idx) => {
-                // Expand the team if collapsed, then select the channel in sidebar.
-                if !self.sidebar.teams[team_idx].expanded {
-                    self.sidebar.teams[team_idx].expanded = true;
-                }
-                // Find the flat index of this channel in the sidebar.
+                self.sidebar.expand_team(team_idx);
                 let items = self.sidebar.flat_items();
                 for (idx, item) in items.iter().enumerate() {
                     if let super::sidebar::SidebarItem::Channel(ti, ci) = item {
@@ -426,7 +388,6 @@ impl App {
                 self.active_pane = Pane::Sidebar;
             }
             SearchResultKind::Chat(chat_idx) => {
-                // Select the chat in the sidebar.
                 let items = self.sidebar.flat_items();
                 for (idx, item) in items.iter().enumerate() {
                     if let super::sidebar::SidebarItem::Chat(ci) = item {
@@ -439,7 +400,6 @@ impl App {
                 self.active_pane = Pane::Sidebar;
             }
             SearchResultKind::Message(msg_idx) => {
-                // Select the message in the messages pane.
                 if msg_idx < self.messages.messages.len() {
                     self.messages.selected = msg_idx;
                 }
@@ -450,11 +410,13 @@ impl App {
         self.search.deactivate();
     }
 
-    /// Handle a response from the async backend.
     fn handle_backend_response(&mut self, response: BackendResponse, backend: &Backend) {
         match response {
             BackendResponse::Teams(Ok(teams)) => {
                 self.sidebar.update_teams(teams);
+                if !self.sidebar.chats.is_empty() {
+                    self.prefetch_sidebar_messages(backend);
+                }
                 self.sidebar.loading = false;
                 self.close_stale_search();
                 // If this is the first data load and we have teams, select the first
@@ -469,6 +431,9 @@ impl App {
             }
             BackendResponse::Chats(Ok(chats)) => {
                 self.sidebar.update_chats(chats);
+                if !self.sidebar.teams.is_empty() {
+                    self.prefetch_sidebar_messages(backend);
+                }
                 self.sidebar.loading = false;
                 self.close_stale_search();
             }
@@ -477,7 +442,6 @@ impl App {
                 self.sidebar.loading = false;
             }
             BackendResponse::Messages { chat_id, result } => {
-                // Only apply if this is still the chat we're looking at.
                 if self.current_chat_id.as_deref() == Some(&chat_id) {
                     match result {
                         Ok(msgs) => {
@@ -495,8 +459,10 @@ impl App {
             BackendResponse::MessageSent(Ok(())) => {
                 self.status_message = Some("Message sent".to_string());
                 self.status_is_error = false;
-                // Reload messages for the current chat.
                 if let Some(ref chat_id) = self.current_chat_id {
+                    backend.send(BackendCommand::InvalidateMessages {
+                        chat_id: chat_id.clone(),
+                    });
                     backend.send(BackendCommand::LoadMessages {
                         chat_id: chat_id.clone(),
                         limit: 50,
@@ -508,25 +474,11 @@ impl App {
             }
             BackendResponse::UserInfo(Ok(info)) => {
                 self.user_name = info.display_name;
+                self.connection_state = "Connected".to_string();
+                self.is_online = true;
             }
             BackendResponse::UserInfo(Err(e)) => {
                 self.set_error(format!("Failed to load user info: {:#}", e));
-            }
-            BackendResponse::Presence(Ok(presence)) => {
-                let is_online = presence.availability != "Offline"
-                    && presence.availability != "PresenceUnknown";
-                self.is_online = is_online;
-                self.connection_state = if is_online {
-                    "Connected".to_string()
-                } else {
-                    format!("Status: {}", presence.availability)
-                };
-            }
-            BackendResponse::Presence(Err(e)) => {
-                tracing::debug!("Failed to load presence: {:#}", e);
-                // Presence failure is non-critical; don't show error in status bar.
-                self.connection_state = "Connected".to_string();
-                self.is_online = true;
             }
             BackendResponse::ClientError(msg) => {
                 self.connection_state = "Not authenticated".to_string();
@@ -540,31 +492,26 @@ impl App {
     /// Close the search overlay if it's open.
     ///
     /// Called when backend data arrives to prevent stale search result indices
-    /// from pointing at the wrong sidebar/message items.
     fn close_stale_search(&mut self) {
         if self.search.active {
             self.search.deactivate();
         }
     }
 
-    /// Set an error status message.
     fn set_error(&mut self, msg: String) {
         self.status_message = Some(msg);
         self.status_is_error = true;
     }
 
-    /// Render the UI
     pub fn render(&self, frame: &mut ratatui::Frame) {
         ui::render(frame, self);
     }
 }
 
-/// Run the TUI application with terminal restore on exit.
 ///
 /// Sets up a panic hook so the terminal is always restored even on panic.
 /// Requires a LogBuffer for capturing tracing output into the debug log pane.
 pub async fn run(log_buffer: LogBuffer) -> Result<()> {
-    // Install a panic hook that restores the terminal before printing the panic.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -582,14 +529,11 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
     let mut backend = Backend::start();
     let mut events = EventStream::new();
 
-    // Fire initial data loads.
     backend.send(BackendCommand::LoadTeams);
     backend.send(BackendCommand::LoadChats { limit: 50 });
     backend.send(BackendCommand::LoadUserInfo);
-    backend.send(BackendCommand::LoadPresence);
 
     while !app.should_exit {
-        // Drain log buffer before rendering to keep it from growing unbounded.
         app.debug_log.refresh();
         terminal.draw(|frame| app.render(frame))?;
 
@@ -603,7 +547,6 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
                         tracing::error!("Event stream error: {:#}", e);
                     }
                     None => {
-                        // Event stream ended.
                         break;
                     }
                 }
@@ -614,7 +557,6 @@ async fn run_app(terminal: &mut DefaultTerminal, log_buffer: LogBuffer) -> Resul
                         app.handle_backend_response(response, &backend);
                     }
                     None => {
-                        // Backend channel closed.
                         break;
                     }
                 }

@@ -1,0 +1,24 @@
+[package]
+name = "ost-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+ost-microsoft = { path = "../ost-microsoft" }
+ost-platform = { path = "../ost-platform" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
+tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures = "0.3"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+base64 = "0.22"
+flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

@@ -62,7 +62,6 @@ fn display_loop(title: &str, rx: mpsc::Receiver<DisplayFrame>) -> Result<()> {
         .video()
         .map_err(|e| anyhow::anyhow!("SDL2 video init failed: {}", e))?;
 
-    // Start with a default size; resize when we get the first frame
     let window = video_subsystem
         .window(title, 640, 480)
         .position_centered()
@@ -90,23 +89,18 @@ fn display_loop(title: &str, rx: mpsc::Receiver<DisplayFrame>) -> Result<()> {
         // Pump SDL events (window close, etc.)
         for event in event_pump.poll_iter() {
             use sdl2::event::Event;
-            match event {
-                Event::Quit { .. } => {
-                    tracing::info!("Video display window closed");
-                    return Ok(());
-                }
-                _ => {}
+            if let Event::Quit { .. } = event {
+                tracing::info!("Video display window closed");
+                return Ok(());
             }
         }
 
-        // Try to receive a frame (non-blocking with short timeout)
         match rx.recv_timeout(std::time::Duration::from_millis(16)) {
             Ok(frame) => {
                 if frame.width == 0 || frame.height == 0 {
                     continue;
                 }
 
-                // Recreate texture if resolution changed
                 if frame.width != current_w || frame.height != current_h {
                     current_w = frame.width;
                     current_h = frame.height;
@@ -143,9 +137,7 @@ fn display_loop(title: &str, rx: mpsc::Receiver<DisplayFrame>) -> Result<()> {
                     canvas.present();
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No frame — just keep the window alive
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::info!("Display frame channel closed, shutting down window");
                 return Ok(());

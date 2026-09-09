@@ -4,53 +4,12 @@
 //! bypassing Graph API which requires tenant admin consent for Chat.Read.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use ost_microsoft::teams::{
+    self as microsoft_teams,
+    models::{Conversation, ConversationsResponse, LegacyMessagesResponse},
+};
 
 use super::client::TeamsClient;
-
-// -- Response types for the native chat API --
-
-#[derive(Debug, Deserialize)]
-struct ConversationsResponse {
-    conversations: Option<Vec<Conversation>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Conversation {
-    id: Option<String>,
-    #[serde(rename = "threadProperties")]
-    thread_properties: Option<ThreadProperties>,
-    #[serde(rename = "lastMessage")]
-    last_message: Option<NativeMessage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ThreadProperties {
-    topic: Option<String>,
-    #[serde(rename = "lastjoinat")]
-    last_join_at: Option<String>,
-    /// For 1:1 chats, contains member MRIs
-    members: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NativeMessage {
-    id: Option<String>,
-    #[serde(rename = "composetime")]
-    compose_time: Option<String>,
-    #[serde(rename = "originalarrivaltime")]
-    original_arrival_time: Option<String>,
-    #[serde(rename = "imdisplayname")]
-    im_display_name: Option<String>,
-    content: Option<String>,
-    messagetype: Option<String>,
-    from: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessagesResponse {
-    messages: Option<Vec<NativeMessage>>,
-}
 
 /// Strip HTML tags from content for CLI display.
 fn strip_html(html: &str) -> String {
@@ -64,7 +23,6 @@ fn strip_html(html: &str) -> String {
             _ => {}
         }
     }
-    // Decode common HTML entities
     result
         .replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -83,7 +41,6 @@ fn conversation_name(conv: &Conversation) -> String {
             }
         }
     }
-    // Fall back to last message sender or the thread ID
     if let Some(ref msg) = conv.last_message {
         if let Some(ref name) = msg.im_display_name {
             if !name.is_empty() {
@@ -182,12 +139,7 @@ pub async fn send_message_with_client(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Data-returning API functions for TUI integration
-// ---------------------------------------------------------------------------
-
 /// Chat metadata for TUI display.
-#[allow(dead_code)]
 pub struct ChatInfo {
     pub id: String,
     pub name: String,
@@ -198,6 +150,7 @@ pub struct ChatInfo {
 }
 
 /// A single message for TUI display.
+#[derive(Clone)]
 pub struct MessageInfo {
     pub sender: String,
     pub timestamp: String,
@@ -207,10 +160,7 @@ pub struct MessageInfo {
 /// List recent chats and return structured data.
 pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<ChatInfo>> {
     // Strategy 1: CSA AFD endpoint with Bearer auth
-    let csa_url = format!(
-        "https://teams.microsoft.com/api/csa/api/v1/teams/users/ME/conversations?view=mychats&pageSize={}",
-        limit
-    );
+    let csa_url = microsoft_teams::csa_conversations_url(limit);
     tracing::debug!("Trying CSA endpoint: {}", csa_url);
     let resp = match client.csa_get(&csa_url).await {
         Ok(r) => r,
@@ -309,21 +259,16 @@ pub async fn read_messages_data(
 
     tracing::debug!("Reading messages from {}", url);
     let resp = client.chat_get(&url).await?;
-    let body: MessagesResponse = resp
+    let body: LegacyMessagesResponse = resp
         .json()
         .await
         .context("Failed to parse messages response")?;
 
     let messages = body.messages.unwrap_or_default();
 
-    // Messages come newest-first; reverse for chronological display
-    let mut msgs: Vec<&NativeMessage> = messages.iter().collect();
-    msgs.reverse();
-
     let mut result = Vec::new();
-    for msg in &msgs {
+    for msg in messages.iter().rev() {
         let msgtype = msg.messagetype.as_deref().unwrap_or("");
-        // Skip non-text messages (e.g. ThreadActivity/*)
         if !msgtype.contains("Text") && !msgtype.contains("RichText") {
             continue;
         }

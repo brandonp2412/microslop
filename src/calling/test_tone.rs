@@ -11,6 +11,12 @@ pub struct ToneGenerator {
     amplitude: f64,
 }
 
+impl Default for ToneGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToneGenerator {
     pub fn new() -> Self {
         Self {
@@ -21,7 +27,6 @@ impl ToneGenerator {
         }
     }
 
-    /// Generate the next 160-sample frame (20ms at 8kHz).
     pub fn next_frame(&mut self) -> Vec<i16> {
         let mut samples = Vec::with_capacity(160);
         let phase_inc = 2.0 * std::f64::consts::PI * self.frequency / self.sample_rate;
@@ -62,7 +67,6 @@ impl AudioRecorder {
     }
 }
 
-/// Result of echo detection analysis.
 #[derive(Debug)]
 pub struct EchoResult {
     pub detected: bool,
@@ -74,7 +78,6 @@ pub struct EchoResult {
 ///
 /// Slides a one-period reference sine over `received` and computes
 /// normalized cross-correlation. A peak above threshold means the
-/// tone was echoed back.
 pub fn detect_echo(received: &[i16], tone_freq: f64, sample_rate: f64) -> EchoResult {
     let period_samples = (sample_rate / tone_freq) as usize;
     if received.len() < period_samples * 2 {
@@ -85,14 +88,12 @@ pub fn detect_echo(received: &[i16], tone_freq: f64, sample_rate: f64) -> EchoRe
         };
     }
 
-    // Generate one period of reference sine
     let mut reference = Vec::with_capacity(period_samples);
     for i in 0..period_samples {
         let t = i as f64 / sample_rate;
         reference.push((2.0 * std::f64::consts::PI * tone_freq * t).sin());
     }
 
-    // Compute reference energy
     let ref_energy: f64 = reference.iter().map(|x| x * x).sum();
 
     let mut best_corr = 0.0f64;
@@ -137,7 +138,6 @@ mod tests {
         let mut gen = ToneGenerator::new();
         let frame = gen.next_frame();
         assert_eq!(frame.len(), 160);
-        // Should have positive and negative values (sine wave)
         assert!(frame.iter().any(|&s| s > 1000));
         assert!(frame.iter().any(|&s| s < -1000));
     }
@@ -148,7 +148,6 @@ mod tests {
         rec.push_frame(&vec![100i16; 160]);
         rec.push_frame(&vec![200i16; 160]);
         assert_eq!(rec.samples().len(), 320);
-        // Should not exceed max
         rec.push_frame(&vec![300i16; 160]);
         assert_eq!(rec.samples().len(), 320);
     }
@@ -158,8 +157,7 @@ mod tests {
         // Generate a 1kHz tone and feed it as "received" audio
         let mut gen = ToneGenerator::new();
         let mut samples = Vec::new();
-        // Add some silence then the tone
-        samples.extend_from_slice(&vec![0i16; 400]); // 50ms silence
+        samples.extend_from_slice(&vec![0i16; 400]);
         for _ in 0..25 {
             samples.extend_from_slice(&gen.next_frame());
         }

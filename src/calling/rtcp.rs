@@ -12,22 +12,21 @@ const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 const PT_SR: u8 = 200;
 const PT_RR: u8 = 201;
 const PT_SDES: u8 = 202;
+const PT_PSFB: u8 = 206;
 
-/// SDES item types.
 const SDES_CNAME: u8 = 1;
 
 /// Statistics for tracking received RTP packets (used to build RR blocks).
 #[derive(Debug, Clone, Default)]
 pub struct RtpRecvStats {
     pub packets_received: u32,
-    pub highest_seq: u32, // extended highest sequence number
+    pub highest_seq: u32,
     pub jitter: u32,      // interarrival jitter (RFC 3550 A.8), fixed-point
     pub last_sr_ntp: u32, // middle 32 bits of NTP timestamp from last SR
     pub last_sr_recv_time: Option<std::time::Instant>,
     pub packets_lost: u32,
     pub expected_prior: u32,
     pub received_prior: u32,
-    /// Previous transit time for jitter calculation.
     prev_transit: i64,
 }
 
@@ -41,6 +40,17 @@ pub struct RtpSendStats {
 }
 
 /// Parsed RTCP block from incoming compound packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverReportBlock {
+    pub source_ssrc: u32,
+    pub fraction_lost: u8,
+    pub cumulative_lost: i32,
+    pub extended_highest_sequence_number: u32,
+    pub interarrival_jitter: u32,
+    pub last_sender_report: u32,
+    pub delay_since_last_sender_report: u32,
+}
+
 #[derive(Debug)]
 pub enum RtcpBlock {
     SenderReport {
@@ -52,6 +62,17 @@ pub enum RtcpBlock {
     },
     ReceiverReport {
         ssrc: u32,
+        report_ssrcs: Vec<u32>,
+    },
+    PictureLossIndication {
+        sender_ssrc: u32,
+        media_ssrc: u32,
+    },
+    VideoSourceRequest {
+        sender_ssrc: u32,
+        requested_msi: u32,
+        request_id: u16,
+        keyframe_requested: bool,
     },
     Sdes,
     Unknown(u8),
@@ -59,7 +80,6 @@ pub enum RtcpBlock {
 
 /// Check if a UDP packet is RTCP (demux from RTP/STUN on same port).
 ///
-/// RTCP packets have payload type 200-204 in byte[1].
 /// RTP packets use payload types 0-127 (or with marker bit: 128-255 but PT field is 0-127).
 /// We check byte[1] (which in RTP is M|PT, in RTCP is PT directly).
 pub fn is_rtcp_packet(data: &[u8]) -> bool {
@@ -67,7 +87,7 @@ pub fn is_rtcp_packet(data: &[u8]) -> bool {
         return false;
     }
     let pt = data[1];
-    pt >= 200 && pt <= 204
+    (200..=206).contains(&pt)
 }
 
 /// Get current NTP timestamp (seconds since 1900-01-01, 32.32 fixed point).
@@ -88,7 +108,6 @@ pub fn update_jitter(stats: &mut RtpRecvStats, rtp_timestamp: u32, arrival_clock
     let transit = arrival_clock as i64 - rtp_timestamp as i64;
     if stats.prev_transit != 0 {
         let d = (transit - stats.prev_transit).unsigned_abs() as u32;
-        // jitter += (1/16) * (|d| - jitter)
         stats.jitter = stats
             .jitter
             .wrapping_add(d.wrapping_sub(stats.jitter).wrapping_add(8) >> 4);
@@ -109,8 +128,6 @@ pub fn build_sender_report(
     let ntp_hi = (ntp >> 32) as u32;
     let ntp_lo = ntp as u32;
 
-    // --- SR packet ---
-    // RC=1 if we have a remote SSRC to report on, else RC=0
     let rc: u8 = if remote_ssrc != 0 && recv_stats.packets_received > 0 {
         1
     } else {
@@ -121,11 +138,9 @@ pub fn build_sender_report(
     buf.push(0x80 | rc);
     buf.push(PT_SR);
 
-    // Length placeholder (in 32-bit words minus 1)
     let len_pos = buf.len();
-    buf.extend_from_slice(&[0, 0]); // filled later
+    buf.extend_from_slice(&[0, 0]);
 
-    // SSRC of sender
     buf.extend_from_slice(&send_stats.ssrc.to_be_bytes());
 
     // NTP timestamp
@@ -135,18 +150,13 @@ pub fn build_sender_report(
     // RTP timestamp (corresponding to NTP time)
     buf.extend_from_slice(&send_stats.last_rtp_timestamp.to_be_bytes());
 
-    // Sender's packet count
     buf.extend_from_slice(&send_stats.packets_sent.to_be_bytes());
 
-    // Sender's octet count
     buf.extend_from_slice(&send_stats.bytes_sent.to_be_bytes());
 
-    // Report block (if we have received packets from remote)
     if rc == 1 {
-        // SSRC_1 (source being reported)
         buf.extend_from_slice(&remote_ssrc.to_be_bytes());
 
-        // Fraction lost + cumulative lost
         let expected = recv_stats
             .highest_seq
             .wrapping_sub(recv_stats.expected_prior);
@@ -165,16 +175,13 @@ pub fn build_sender_report(
         buf.push((cumulative_lost >> 8) as u8);
         buf.push(cumulative_lost as u8);
 
-        // Extended highest sequence number received
         buf.extend_from_slice(&recv_stats.highest_seq.to_be_bytes());
 
-        // Interarrival jitter
         buf.extend_from_slice(&recv_stats.jitter.to_be_bytes());
 
         // Last SR (middle 32 bits of NTP timestamp from last received SR)
         buf.extend_from_slice(&recv_stats.last_sr_ntp.to_be_bytes());
 
-        // DLSR (delay since last SR, in 1/65536 seconds)
         let dlsr = if let Some(recv_time) = recv_stats.last_sr_recv_time {
             let elapsed = recv_time.elapsed();
             let secs = elapsed.as_secs() as u32;
@@ -191,7 +198,6 @@ pub fn build_sender_report(
     buf[len_pos] = (sr_words >> 8) as u8;
     buf[len_pos + 1] = sr_words as u8;
 
-    // --- SDES packet ---
     append_sdes(&mut buf, send_stats.ssrc, cname);
 
     buf
@@ -263,7 +269,6 @@ fn append_sdes(buf: &mut Vec<u8>, ssrc: u32, cname: &str) {
     let len_pos = buf.len();
     buf.extend_from_slice(&[0, 0]);
 
-    // SSRC/CSRC chunk
     buf.extend_from_slice(&ssrc.to_be_bytes());
 
     // CNAME item
@@ -272,17 +277,67 @@ fn append_sdes(buf: &mut Vec<u8>, ssrc: u32, cname: &str) {
     buf.push(cname_bytes.len() as u8);
     buf.extend_from_slice(cname_bytes);
 
-    // End item
     buf.push(0);
 
-    // Pad to 4-byte boundary
-    while (buf.len() - sdes_start) % 4 != 0 {
+    while !(buf.len() - sdes_start).is_multiple_of(4) {
         buf.push(0);
     }
 
     let sdes_words = (buf.len() - sdes_start) / 4 - 1;
     buf[len_pos] = (sdes_words >> 8) as u8;
     buf[len_pos + 1] = sdes_words as u8;
+}
+
+fn parse_signed_24(bytes: &[u8]) -> Option<i32> {
+    let bytes: [u8; 3] = bytes.try_into().ok()?;
+    let raw = ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | bytes[2] as u32;
+    Some(if raw & 0x0080_0000 != 0 {
+        (raw | 0xff00_0000) as i32
+    } else {
+        raw as i32
+    })
+}
+
+fn parse_receiver_report_block(block: &[u8]) -> Option<ReceiverReportBlock> {
+    if block.len() < 24 {
+        return None;
+    }
+    Some(ReceiverReportBlock {
+        source_ssrc: u32::from_be_bytes(block[0..4].try_into().ok()?),
+        fraction_lost: block[4],
+        cumulative_lost: parse_signed_24(&block[5..8])?,
+        extended_highest_sequence_number: u32::from_be_bytes(block[8..12].try_into().ok()?),
+        interarrival_jitter: u32::from_be_bytes(block[12..16].try_into().ok()?),
+        last_sender_report: u32::from_be_bytes(block[16..20].try_into().ok()?),
+        delay_since_last_sender_report: u32::from_be_bytes(block[20..24].try_into().ok()?),
+    })
+}
+
+pub fn find_receiver_report_block(data: &[u8], source_ssrc: u32) -> Option<ReceiverReportBlock> {
+    let mut offset = 0;
+    while offset + 4 <= data.len() {
+        let pt = data[offset + 1];
+        let length_words = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        let packet_len = (length_words + 1) * 4;
+        if offset + packet_len > data.len() {
+            return None;
+        }
+        let packet = &data[offset..offset + packet_len];
+        if pt == PT_RR && packet.len() >= 8 {
+            let report_count = (packet[0] & 0x1f) as usize;
+            for index in 0..report_count {
+                let start = 8 + index * 24;
+                let end = start + 24;
+                if let Some(report) = packet.get(start..end).and_then(parse_receiver_report_block) {
+                    if report.source_ssrc == source_ssrc {
+                        return Some(report);
+                    }
+                }
+            }
+        }
+        offset += packet_len;
+    }
+    None
 }
 
 /// Parse incoming RTCP compound packet into blocks.
@@ -320,10 +375,38 @@ pub fn parse_rtcp(data: &[u8]) -> Vec<RtcpBlock> {
             }
             PT_RR if pkt.len() >= 8 => {
                 let ssrc = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
-                blocks.push(RtcpBlock::ReceiverReport { ssrc });
+                let report_count = (pkt[0] & 0x1f) as usize;
+                let report_ssrcs = (0..report_count)
+                    .filter_map(|index| {
+                        let start = 8 + index * 24;
+                        pkt.get(start..start + 4)
+                            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+                    })
+                    .collect();
+                blocks.push(RtcpBlock::ReceiverReport { ssrc, report_ssrcs });
             }
             PT_SDES => {
                 blocks.push(RtcpBlock::Sdes);
+            }
+            PT_PSFB if pkt.len() >= 12 => {
+                let fmt = pkt[0] & 0x1f;
+                let sender_ssrc = u32::from_be_bytes(pkt[4..8].try_into().unwrap());
+                let media_ssrc = u32::from_be_bytes(pkt[8..12].try_into().unwrap());
+                if fmt == 1 {
+                    blocks.push(RtcpBlock::PictureLossIndication {
+                        sender_ssrc,
+                        media_ssrc,
+                    });
+                } else if let Some(vsr) = ost_microsoft::calling::parse_video_source_request(pkt) {
+                    blocks.push(RtcpBlock::VideoSourceRequest {
+                        sender_ssrc: vsr.sender_ssrc,
+                        requested_msi: vsr.requested_msi,
+                        request_id: vsr.request_id,
+                        keyframe_requested: vsr.keyframe_requested,
+                    });
+                } else {
+                    blocks.push(RtcpBlock::Unknown(pt));
+                }
             }
             other => {
                 blocks.push(RtcpBlock::Unknown(other));
@@ -350,13 +433,45 @@ mod tests {
 
     #[test]
     fn test_is_rtcp_packet() {
-        // SR: byte[1] = 200
         let sr = [0x80, 200, 0, 6, 0, 0, 0, 0];
         assert!(is_rtcp_packet(&sr));
+
+        let vsr = ost_microsoft::calling::video_source_request(0x1234_5678, 7);
+        assert!(is_rtcp_packet(&vsr));
 
         // RTP PCMU: byte[1] = 0
         let rtp = [0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(!is_rtcp_packet(&rtp));
+    }
+
+    #[test]
+    fn parses_microsoft_video_source_request() {
+        let packet = ost_microsoft::calling::video_source_request(0x1234_5678, 0x4321);
+
+        assert!(matches!(
+            parse_rtcp(&packet).as_slice(),
+            [RtcpBlock::VideoSourceRequest {
+                sender_ssrc: 0x1234_5678,
+                requested_msi: ost_microsoft::calling::VIDEO_SOURCE_ANY,
+                request_id: 0x4321,
+                keyframe_requested: true,
+            }]
+        ));
+    }
+
+    #[test]
+    fn parses_picture_loss_indication() {
+        let mut packet = vec![0x81, PT_PSFB, 0, 2];
+        packet.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+        packet.extend_from_slice(&0x8765_4321u32.to_be_bytes());
+
+        assert!(matches!(
+            parse_rtcp(&packet).as_slice(),
+            [RtcpBlock::PictureLossIndication {
+                sender_ssrc: 0x1234_5678,
+                media_ssrc: 0x8765_4321,
+            }]
+        ));
     }
 
     #[test]
@@ -370,7 +485,6 @@ mod tests {
         let recv = RtpRecvStats::default();
         let buf = build_sender_report(&send, &recv, 0, "test@example.com");
 
-        // Should be parseable
         let blocks = parse_rtcp(&buf);
         assert!(!blocks.is_empty());
         match &blocks[0] {
@@ -398,21 +512,55 @@ mod tests {
         let blocks = parse_rtcp(&buf);
         assert!(!blocks.is_empty());
         match &blocks[0] {
-            RtcpBlock::ReceiverReport { ssrc } => {
+            RtcpBlock::ReceiverReport { ssrc, report_ssrcs } => {
                 assert_eq!(*ssrc, 0xAABBCCDD);
+                assert_eq!(report_ssrcs, &[0x11223344]);
             }
             other => panic!("Expected ReceiverReport, got {:?}", other),
         }
     }
 
     #[test]
+    fn finds_receiver_report_metrics_for_source_ssrc() {
+        let packet = [
+            0x81, 0xc9, 0x00, 0x07, 0x00, 0x00, 0x03, 0xe9, 0xbc, 0x9e, 0x2d, 0x52, 0x40, 0xff,
+            0xff, 0xfe, 0x00, 0x01, 0x23, 0x45, 0x00, 0x00, 0x00, 0x77, 0x48, 0x68, 0xfc, 0x0e,
+            0x00, 0x03, 0x8f, 0x21,
+        ];
+        let report = find_receiver_report_block(&packet, 0xbc9e2d52).unwrap();
+        assert_eq!(report.source_ssrc, 0xbc9e2d52);
+        assert_eq!(report.fraction_lost, 0x40);
+        assert_eq!(report.cumulative_lost, -2);
+        assert_eq!(report.extended_highest_sequence_number, 0x0001_2345);
+        assert_eq!(report.interarrival_jitter, 0x77);
+        assert_eq!(report.last_sender_report, 0x4868_fc0e);
+        assert_eq!(report.delay_since_last_sender_report, 0x0003_8f21);
+        assert!(find_receiver_report_block(&packet, 0x1234_5678).is_none());
+    }
+
+    #[test]
+    fn parses_receiver_report_source_ssrcs() {
+        let packet = [
+            0x81, 0xc9, 0x00, 0x07, 0x00, 0x00, 0x03, 0xe9, 0xbc, 0x9e, 0x2d, 0x52, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x68, 0xfc, 0x0e,
+            0x00, 0x03, 0x8f, 0x21,
+        ];
+        let blocks = parse_rtcp(&packet);
+        match &blocks[0] {
+            RtcpBlock::ReceiverReport { ssrc, report_ssrcs } => {
+                assert_eq!(*ssrc, 1001);
+                assert_eq!(report_ssrcs, &[0xbc9e2d52]);
+            }
+            other => panic!("Expected ReceiverReport, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_update_jitter() {
         let mut stats = RtpRecvStats::default();
-        // Simulate receiving packets with consistent timing
         for i in 0..10u32 {
             update_jitter(&mut stats, i * 160, i * 160);
         }
-        // With perfect timing, jitter should be zero or very small
         assert!(stats.jitter < 10, "jitter={}", stats.jitter);
     }
 }

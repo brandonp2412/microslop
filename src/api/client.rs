@@ -3,13 +3,10 @@
 //! Wraps reqwest::Client with automatic token injection and refresh.
 
 use anyhow::{bail, Context, Result};
+use ost_microsoft::teams as microsoft_teams;
 
 use crate::auth::TokenStore;
 use crate::config::Config;
-
-const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
-const DEFAULT_CHAT_SERVICE: &str = "https://amer.ng.msg.teams.microsoft.com";
-const CHATSVCAGG: &str = "https://chatsvcagg.teams.microsoft.com";
 
 /// Authenticated client that handles both Graph (AAD) and Teams (Skype) APIs.
 pub struct TeamsClient {
@@ -22,9 +19,8 @@ impl TeamsClient {
     pub async fn new() -> Result<Self> {
         let mut config = Config::load()?;
 
-        // Auto-refresh if any token is expired but refresh token exists
-        let needs_refresh = config.get_access_token().map_or(true, |t| t.is_expired())
-            || config.get_graph_token().map_or(true, |t| t.is_expired());
+        let needs_refresh = config.get_access_token().is_none_or(|t| t.is_expired())
+            || config.get_graph_token().is_none_or(|t| t.is_expired());
         if needs_refresh {
             if config.get_refresh_token().is_some() {
                 tracing::info!("Tokens missing or expired, refreshing...");
@@ -76,7 +72,7 @@ impl TeamsClient {
     /// GET request to Microsoft Graph API (bearer auth with Graph token).
     pub async fn graph_get(&self, path: &str) -> Result<reqwest::Response> {
         let token = self.graph_token()?;
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = format!("{}{}", microsoft_teams::GRAPH_BASE, path);
         tracing::debug!("Graph GET {}", url);
 
         let resp = self
@@ -90,65 +86,6 @@ impl TeamsClient {
         check_response(resp, &url).await
     }
 
-    /// POST request to Microsoft Graph API (bearer auth with Graph token).
-    pub async fn graph_post(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response> {
-        let token = self.graph_token()?;
-        let url = format!("{}{}", GRAPH_BASE, path);
-        tracing::debug!("Graph POST {}", url);
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("Graph POST {} failed", url))?;
-
-        check_response(resp, &url).await
-    }
-
-    /// GET request to Teams/Skype API (X-SkypeToken header).
-    pub async fn teams_get(&self, url: &str) -> Result<reqwest::Response> {
-        let token = self.skype_token()?;
-        tracing::debug!("Teams GET {}", url);
-
-        let resp = self
-            .http
-            .get(url)
-            .header("X-SkypeToken", &token)
-            .send()
-            .await
-            .with_context(|| format!("Teams GET {} failed", url))?;
-
-        check_response(resp, url).await
-    }
-
-    /// POST request to Teams/Skype API (X-SkypeToken header).
-    pub async fn teams_post(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response> {
-        let token = self.skype_token()?;
-        tracing::debug!("Teams POST {}", url);
-
-        let resp = self
-            .http
-            .post(url)
-            .header("X-SkypeToken", &token)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("Teams POST {} failed", url))?;
-
-        check_response(resp, url).await
-    }
-
     /// Chat service base URL from region_gtms, falling back to default.
     pub fn chat_service_url(&self) -> String {
         self.config
@@ -158,7 +95,7 @@ impl TeamsClient {
                     .and_then(|s| s.as_str())
                     .map(String::from)
             })
-            .unwrap_or_else(|| DEFAULT_CHAT_SERVICE.to_string())
+            .unwrap_or_else(|| microsoft_teams::DEFAULT_CHAT_SERVICE.to_string())
     }
 
     /// Chat service aggregator URL from region_gtms, falling back to default.
@@ -170,7 +107,7 @@ impl TeamsClient {
                     .and_then(|s| s.as_str())
                     .map(String::from)
             })
-            .unwrap_or_else(|| CHATSVCAGG.to_string())
+            .unwrap_or_else(|| microsoft_teams::CHATSVCAGG_BASE.to_string())
     }
 
     /// GET using `Authorization: Bearer {skype_token}` with client version header (CSA/AFD endpoint).
@@ -182,7 +119,10 @@ impl TeamsClient {
             .http
             .get(url)
             .bearer_auth(&token)
-            .header("x-ms-client-version", "1416/1.0.0.2024050301")
+            .header(
+                microsoft_teams::CSA_CLIENT_VERSION_HEADER,
+                microsoft_teams::CSA_CLIENT_VERSION,
+            )
             .send()
             .await
             .with_context(|| format!("CSA GET {} failed", url))?;
@@ -198,7 +138,10 @@ impl TeamsClient {
         let resp = self
             .http
             .get(url)
-            .header("Authentication", format!("skypetoken={}", token))
+            .header(
+                microsoft_teams::NATIVE_AUTH_HEADER,
+                microsoft_teams::native_auth_value(&token),
+            )
             .send()
             .await
             .with_context(|| format!("Chat GET {} failed", url))?;
@@ -218,7 +161,10 @@ impl TeamsClient {
         let resp = self
             .http
             .post(url)
-            .header("Authentication", format!("skypetoken={}", token))
+            .header(
+                microsoft_teams::NATIVE_AUTH_HEADER,
+                microsoft_teams::native_auth_value(&token),
+            )
             .json(body)
             .send()
             .await

@@ -8,17 +8,14 @@ use ratatui::{
     Frame,
 };
 
-/// Popup dimensions.
 const POPUP_WIDTH: u16 = 84;
 const POPUP_HEIGHT: u16 = 30;
 
-/// A shortcut entry: key binding and its description.
 struct Shortcut {
     key: &'static str,
     desc: &'static str,
 }
 
-/// A category of shortcuts with a title.
 struct Category {
     title: &'static str,
     shortcuts: &'static [Shortcut],
@@ -192,23 +189,18 @@ const MISC: Category = Category {
     ],
 };
 
-/// Render the help popup overlay centered on screen.
 ///
 /// Clears the area behind the popup and draws a bordered box with all
-/// keyboard shortcuts organized in a two-column layout.
 pub fn render_help_popup(frame: &mut Frame) {
     let area = frame.area();
 
-    // Calculate centered popup area, clamped to terminal size.
     let popup_w = POPUP_WIDTH.min(area.width.saturating_sub(2));
     let popup_h = POPUP_HEIGHT.min(area.height.saturating_sub(2));
 
     let popup_area = centered_rect(popup_w, popup_h, area);
 
-    // Clear the background behind the popup.
     frame.render_widget(Clear, popup_area);
 
-    // Outer block with title and footer.
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -233,32 +225,26 @@ pub fn render_help_popup(frame: &mut Frame) {
         return;
     }
 
-    // Split inner area into two columns.
     let [left_col, right_col] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
 
-    // Left column: Navigation, Panes, Views
     let left_lines = build_column_lines(&[&NAVIGATION, &PANES, &VIEWS]);
     let left_para = Paragraph::new(left_lines);
     frame.render_widget(left_para, inset(left_col, 1, 1));
 
-    // Right column: Messaging, Actions, Misc
     let right_lines = build_column_lines(&[&MESSAGING, &ACTIONS, &MISC]);
     let right_para = Paragraph::new(right_lines);
     frame.render_widget(right_para, inset(right_col, 1, 1));
 }
 
-/// Build the lines for one column of categories.
 fn build_column_lines<'a>(categories: &[&Category]) -> Vec<Line<'a>> {
     let mut lines: Vec<Line<'a>> = Vec::new();
 
     for (cat_idx, cat) in categories.iter().enumerate() {
         if cat_idx > 0 {
-            // Blank line between categories.
             lines.push(Line::from(""));
         }
 
-        // Category title.
         lines.push(Line::from(Span::styled(
             cat.title,
             Style::default()
@@ -266,7 +252,6 @@ fn build_column_lines<'a>(categories: &[&Category]) -> Vec<Line<'a>> {
                 .add_modifier(Modifier::BOLD),
         )));
 
-        // Separator line under title.
         let sep_len = 36;
         let sep: String = "\u{2500}".repeat(sep_len);
         lines.push(Line::from(Span::styled(
@@ -274,7 +259,6 @@ fn build_column_lines<'a>(categories: &[&Category]) -> Vec<Line<'a>> {
             Style::default().fg(Color::DarkGray),
         )));
 
-        // Shortcut entries.
         for sc in cat.shortcuts.iter() {
             let key_width = 12;
             let key_display = format!("{:<width$}", sc.key, width = key_width);
@@ -295,7 +279,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
-/// Inset a rect by the given horizontal and vertical margins.
 fn inset(area: Rect, h: u16, v: u16) -> Rect {
     Rect::new(
         area.x + h,

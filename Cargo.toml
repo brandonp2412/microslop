@@ -5,12 +5,18 @@ edition = "2021"
 description = "Lightweight CLI client for Microsoft Teams"
 license = "MIT"
 
+[workspace]
+members = ["crates/ost-core", "crates/ost-microsoft", "crates/ost-platform", "app/rust"]
+resolver = "2"
+
 [dependencies]
+ost-microsoft = { path = "crates/ost-microsoft" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client (use 0.11 for rustc 1.82 compatibility, native-tls avoids ICU issue)
-reqwest = { version = "0.11", features = ["json", "native-tls"], default-features = false }
+# HTTP client (Rustls keeps Android cross-compiles self-contained; no system OpenSSL needed)
+reqwest = { version = "0.11", features = ["json", "rustls-tls-webpki-roots"], default-features = false }
 
 # JSON serialization
 serde = { version = "1", features = ["derive"] }
@@ -54,9 +60,12 @@ toml = "0.8"
 
 # Async utilities
 futures = "0.3"
+async-trait = { version = "0.1", optional = true }
+webrtc = { version = "0.20", optional = true }
+rtc = { version = "0.20", optional = true }
 
 # WebSocket (Trouter)
-tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 unicode-width = "0.2"
@@ -69,10 +78,19 @@ v4l = { version = "0.14", optional = true }
 openh264 = { version = "0.9", optional = true }
 sdl2 = { version = "0.37", optional = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = { version = "0.6.1", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10.11", optional = true, features = ["input-msmf"] }
+
 [features]
 default = []
-audio = ["cpal"]
-video-capture = ["v4l", "openh264", "sdl2"]
+audio = ["cpal", "dep:oboe"]
+video-codec = ["openh264"]
+video-capture = ["v4l", "video-codec", "sdl2"]
+video-capture-windows = ["dep:nokhwa", "video-codec"]
+consumer-webrtc = ["dep:async-trait", "dep:webrtc", "dep:rtc", "video-codec"]
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Message body content type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ContentType {
@@ -10,7 +9,6 @@ pub enum ContentType {
     Html,
 }
 
-/// Message body
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageBody {
@@ -18,7 +16,6 @@ pub struct MessageBody {
     pub content: String,
 }
 
-/// Chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -28,14 +25,12 @@ pub struct Message {
     pub from: Option<MessageFrom>,
 }
 
-/// Message sender
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageFrom {
     pub user: Option<UserIdentity>,
 }
 
-/// User identity in message context
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserIdentity {

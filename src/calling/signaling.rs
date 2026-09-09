@@ -3,17 +3,16 @@
 //! Includes the two-phase conversation API for call placement via epconv.
 
 use anyhow::{Context, Result};
+pub use microsoft_calling::echo_thread_id;
+pub(crate) use microsoft_calling::{
+    trouter_callback, CLIENT_HEADER, MIGRATION_HEADER, MIGRATION_VALUE, PARTITION_HEADER,
+    PROXY_CLUSTER_CONTEXT_HEADER, REFERER_HEADER, REGION_HEADER, RING_HEADER, SKYPE_CLIENT_HEADER,
+    SKYPE_TOKEN_HEADER, TEAMS_PARTITION, TEAMS_REFERER, TEAMS_REGION, TEAMS_RING,
+};
+use ost_microsoft::calling as microsoft_calling;
 
 use super::CallNotification;
 use uuid;
-
-// Common headers for Teams calling API requests.
-// TODO: region headers are hardcoded to AMER — derive from config for other tenants.
-pub(crate) const SKYPE_CLIENT_HEADER: &str =
-    "SkypeSpaces/1415/teams-cli/TsCallingVersion=2025.49.01.15";
-pub(crate) const TEAMS_PARTITION: &str = "amer03";
-pub(crate) const TEAMS_REGION: &str = "amer";
-pub(crate) const TEAMS_RING: &str = "general";
 
 /// Response from phase 1 (create conversation).
 #[derive(Debug)]
@@ -37,7 +36,8 @@ pub struct ConversationJoined {
 
 /// Parameters for the two-phase conversation call placement.
 pub struct ConversationCallParams<'a> {
-    pub ic3_token: &'a str,
+    pub call_token: &'a str,
+    pub personal: bool,
     pub trouter_surl: &'a str,
     pub caller_mri: &'a str,
     pub caller_display_name: &'a str,
@@ -51,24 +51,59 @@ pub struct ConversationCallParams<'a> {
     pub tenant_id: &'a str,
 }
 
-/// Build a Trouter callback URL for a specific path.
-///
-/// Each callback gets a unique 8-hex-char hash (matches Teams web client pattern).
-/// Pattern: `{trouter_surl}callAgent/{endpoint_id}/{hash}/{path}`
-pub(crate) fn trouter_callback(trouter_surl: &str, endpoint_id: &str, path: &str) -> String {
-    let hash = format!("{:08x}", {
-        // Simple hash from endpoint_id + path to produce unique per-path values
-        let mut h: u32 = 0x811c9dc5; // FNV-1a init
-        for b in endpoint_id.bytes().chain(path.bytes()) {
-            h ^= b as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        h
-    });
-    format!(
-        "{}callAgent/{}/{}/{}",
-        trouter_surl, endpoint_id, hash, path
-    )
+fn response_link<'a>(response: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    response
+        .pointer(&format!("/links/{name}"))
+        .or_else(|| response.pointer(&format!("/conversationResponse/links/{name}")))
+        .and_then(|value| value.as_str())
+}
+
+fn payload_context<'a>(
+    params: &ConversationCallParams<'a>,
+) -> microsoft_calling::PayloadContext<'a> {
+    microsoft_calling::PayloadContext {
+        caller_mri: params.caller_mri,
+        caller_display_name: params.caller_display_name,
+        endpoint_id: params.endpoint_id,
+        participant_id: params.participant_id,
+        thread_id: params.thread_id,
+        caller_oid: params.caller_oid,
+        tenant_id: params.tenant_id,
+        message_id: params.message_id,
+    }
+}
+
+fn call_controller_post(
+    http: &reqwest::Client,
+    url: &str,
+    params: &ConversationCallParams<'_>,
+    message_id: &str,
+) -> reqwest::RequestBuilder {
+    let request = http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header(microsoft_calling::CHAIN_ID_HEADER, params.chain_id)
+        .header(microsoft_calling::MESSAGE_ID_HEADER, message_id)
+        .header(CLIENT_HEADER, SKYPE_CLIENT_HEADER)
+        .header(RING_HEADER, TEAMS_RING);
+    if params.personal {
+        request
+            .header(SKYPE_TOKEN_HEADER, params.call_token)
+            .header(REFERER_HEADER, microsoft_calling::TEAMS_LIVE_REFERER)
+    } else {
+        request
+            .header("Authorization", format!("Bearer {}", params.call_token))
+            .header(REFERER_HEADER, TEAMS_REFERER)
+            .header(PARTITION_HEADER, TEAMS_PARTITION)
+            .header(REGION_HEADER, TEAMS_REGION)
+            .header(MIGRATION_HEADER, MIGRATION_VALUE)
+    }
+}
+
+fn skype_post(http: &reqwest::Client, url: &str, skype_token: &str) -> reqwest::RequestBuilder {
+    http.post(url)
+        .header(SKYPE_TOKEN_HEADER, skype_token)
+        .header("Content-Type", "application/json")
 }
 
 /// Phase 1: Create a conversation by POSTing to /api/v2/epconv.
@@ -79,66 +114,9 @@ pub async fn create_conversation(
     epconv_url: &str,
     params: &ConversationCallParams<'_>,
 ) -> Result<ConversationCreated> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-    let cause_id = &params.message_id[..8.min(params.message_id.len())];
-
-    // Note: conversationRequest contains only subject/roster/properties/links.
-    // Other fields (groupChat, participants, etc.) are siblings, not nested inside.
-    let payload = serde_json::json!({
-        "conversationRequest": {
-            "subject": null,
-            "roster": {
-                "type": "Delta",
-                "rosterUpdate": tc("conversation/rosterUpdate/")
-            },
-            "properties": {
-                "allowConversationWithoutHost": true,
-                "enableGroupCallEventMessages": true,
-                "enableGroupCallUpgradeMessage": false,
-                "enableGroupCallMeetupGeneration": true
-            },
-            "links": {
-                "conversationEnd": tc("conversation/conversationEnd/"),
-                "conversationUpdate": tc("conversation/conversationUpdate/"),
-                "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
-                "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-                "addParticipantFailure": tc("conversation/addParticipantFailure/"),
-                "receiveMessage": tc("conversation/receiveMessage/")
-            }
-        },
-        "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
-        },
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            }
-        },
-        "capabilities": null,
-        // Capability bitmasks captured from Teams web client traffic
-        "endpointCapabilities": 73463,
-        "clientEndpointCapabilities": 9336554,
-        "endpointMetadata": { "holographicCapabilities": 3 },
-        "meetingInfo": null,
-        "endpointState": {
-            "endpointStateSequenceNumber": 0,
-            "endpointProperties": {
-                "additionalEndpointProperties": {
-                    "infoShownInReportMode": "FullInformation"
-                }
-            }
-        },
-        "debugContent": {
-            "ecsEtag": "\"0\"",
-            "causeId": cause_id
-        }
-    });
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let payload =
+        microsoft_calling::create_conversation_payload(&payload_context(params), &callback);
 
     tracing::info!("Phase 1: POST {} (create conversation)", epconv_url);
     tracing::debug!(
@@ -146,18 +124,7 @@ pub async fn create_conversation(
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
 
-    let resp = http
-        .post(epconv_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", params.message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
+    let resp = call_controller_post(http, epconv_url, params, params.message_id)
         .json(&payload)
         .send()
         .await
@@ -165,7 +132,6 @@ pub async fn create_conversation(
 
     let status = resp.status();
 
-    // Extract conversationController from response headers or body
     let headers = resp.headers().clone();
     let body = resp.text().await.unwrap_or_default();
 
@@ -183,7 +149,6 @@ pub async fn create_conversation(
         anyhow::bail!("Phase 1 epconv failed ({}): {}", status, body);
     }
 
-    // Parse conversationController from response body
     let resp_json: serde_json::Value =
         serde_json::from_str(&body).context("Phase 1 response is not valid JSON")?;
 
@@ -193,7 +158,6 @@ pub async fn create_conversation(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Also check Location header
     let conv_controller = conv_controller
         .or_else(|| {
             headers
@@ -203,10 +167,7 @@ pub async fn create_conversation(
         })
         .context("No conversationController in phase 1 response")?;
 
-    let add_participant_url = resp_json
-        .pointer("/links/addParticipant")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let add_participant_url = response_link(&resp_json, "addParticipant").map(str::to_owned);
 
     tracing::info!(
         "Phase 1 success: conversationController = {}, addParticipant link = {:?}",
@@ -230,102 +191,12 @@ pub async fn join_conversation_with_sdp(
     params: &ConversationCallParams<'_>,
     sdp_offer: &str,
 ) -> Result<ConversationJoined> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-    let cause_id = &params.message_id[..8.min(params.message_id.len())];
-
-    // Same structure as phase 1: conversationRequest contains only
-    // subject/roster/properties/links. Other fields are siblings.
-    let payload = serde_json::json!({
-        "conversationRequest": {
-            "conversationType": null,
-            "subject": "",
-            "suppressDialout": true,
-            "roster": {
-                "type": "Delta",
-                "rosterUpdate": tc("conversation/rosterUpdate/")
-            },
-            "properties": {
-                "allowConversationWithoutHost": true,
-                "enableGroupCallEventMessages": true,
-                "enableGroupCallUpgradeMessage": false,
-                "enableGroupCallMeetupGeneration": true
-            },
-            "links": {
-                "conversationEnd": tc("conversation/conversationEnd/"),
-                "conversationUpdate": tc("conversation/conversationUpdate/"),
-                "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
-                "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-                "addParticipantFailure": tc("conversation/addParticipantFailure/"),
-                "addModalitySuccess": tc("conversation/addModalitySuccess/"),
-                "addModalityFailure": tc("conversation/addModalityFailure/"),
-                "confirmUnmute": tc("conversation/confirmUnmute/"),
-                "receiveMessage": tc("conversation/receiveMessage/")
-            }
-        },
-        "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
-        },
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": []
-        },
-        // Capability bitmasks captured from Teams web client traffic
-        "capabilities": null,
-        "endpointCapabilities": 73463,
-        "clientEndpointCapabilities": 9336554,
-        "endpointMetadata": { "holographicCapabilities": 3 },
-        "meetingInfo": {
-            "organizerId": params.caller_oid,
-            "tenantId": params.tenant_id
-        },
-        "endpointState": {
-            "endpointStateSequenceNumber": 0,
-            "endpointProperties": {
-                "preheatProperties": 1,
-                "additionalEndpointProperties": {
-                    "infoShownInReportMode": "FullInformation"
-                }
-            }
-        },
-        "callInvitation": {
-            "callModalities": ["Audio"],
-            "replaces": null,
-            "transferor": null,
-            "links": {
-                "progress": tc("call/progress/"),
-                "mediaAnswer": tc("call/mediaAnswer/"),
-                "acceptance": tc("call/acceptance/"),
-                "redirection": tc("call/redirection/"),
-                "end": tc("call/end/")
-            },
-            "clientContentForMediaController": {
-                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
-                "csrcInfo": tc("call/csrcInfo/"),
-                "dominantSpeakerInfo": tc("call/dominantSpeakerInfo/")
-            },
-            "pstnContent": {
-                "emergencyCallCountry": "",
-                "platformName": "teams-cli",
-                "publicApiCall": false
-            },
-            "mediaContent": {
-                "contentType": "application/sdp",
-                "blob": sdp_offer
-            }
-        },
-        "debugContent": {
-            "ecsEtag": "\"0\"",
-            "causeId": cause_id
-        }
-    });
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let payload = microsoft_calling::join_conversation_payload(
+        &payload_context(params),
+        &callback,
+        sdp_offer,
+    );
 
     tracing::info!("Phase 2: POST {} (join with SDP)", conversation_controller);
     tracing::debug!(
@@ -333,18 +204,7 @@ pub async fn join_conversation_with_sdp(
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
 
-    let resp = http
-        .post(conversation_controller)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", params.message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
+    let resp = call_controller_post(http, conversation_controller, params, params.message_id)
         .json(&payload)
         .send()
         .await
@@ -362,7 +222,7 @@ pub async fn join_conversation_with_sdp(
     }
 
     let cc_active_url = headers
-        .get("x-microsoft-skype-proxy-cluster-context")
+        .get(PROXY_CLUSTER_CONTEXT_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -379,6 +239,7 @@ pub async fn accept_call(
     http: &reqwest::Client,
     skype_token: &str,
     notification: &CallNotification,
+    video: bool,
 ) -> Result<()> {
     let invitation = notification
         .call_invitation
@@ -393,20 +254,11 @@ pub async fn accept_call(
         .as_ref()
         .context("No acceptance URL in links")?;
 
-    let payload = serde_json::json!({
-        "acceptedCallModalities": ["Audio"],
-        "endpointMetadata": {
-            "isCallMediaCaptured": false,
-            "isMicrophoneOn": false
-        }
-    });
+    let payload = microsoft_calling::acceptance_payload(video);
 
     tracing::info!("Accepting call -> POST {}", acceptance_url);
 
-    let resp = http
-        .post(acceptance_url)
-        .header("X-Skypetoken", skype_token)
-        .header("Content-Type", "application/json")
+    let resp = skype_post(http, acceptance_url, skype_token)
         .json(&payload)
         .send()
         .await
@@ -443,19 +295,11 @@ pub async fn send_media_answer(
         .as_ref()
         .context("No mediaAnswer URL in links")?;
 
-    let payload = serde_json::json!({
-        "mediaContent": {
-            "blob": sdp_answer,
-            "contentType": "application/sdp"
-        }
-    });
+    let payload = microsoft_calling::media_answer_payload(sdp_answer);
 
     tracing::info!("Sending media answer -> POST {}", media_answer_url);
 
-    let resp = http
-        .post(media_answer_url)
-        .header("X-Skypetoken", skype_token)
-        .header("Content-Type", "application/json")
+    let resp = skype_post(http, media_answer_url, skype_token)
         .json(&payload)
         .send()
         .await
@@ -472,41 +316,27 @@ pub async fn send_media_answer(
     }
 }
 
-/// Build the standard CC signaling callback links for a call leg.
-///
-/// Used by both `acknowledge_call_acceptance` and `register_cc_callbacks`.
-fn cc_call_links(tc: &dyn Fn(&str) -> String) -> serde_json::Value {
-    serde_json::json!({
-        "links": {
-            "mediaAcknowledgement": tc("call/mediaAcknowledgement/"),
-            "rejection": tc("call/rejection/"),
-            "acknowledgement": tc("call/acknowledgement/"),
-            "mediaRenegotiation": tc("call/mediaRenegotiation/"),
-            "replacement": tc("call/replacement/"),
-            "progress": tc("call/progress/"),
-            "mediaAnswer": tc("call/mediaAnswer/"),
-            "newMediaOffer": tc("call/newMediaOffer/"),
-            "redirection": tc("call/redirection/"),
-            "balanceUpdate": tc("call/balanceUpdate/"),
-            "acceptance": tc("call/acceptance/"),
-            "controlVideoStreaming": tc("call/controlVideoStreaming/"),
-            "dominantSpeakerInfo": tc("call/dominantSpeakerInfo/"),
-            "csrcInfo": tc("call/csrcInfo/"),
-            "end": tc("call/end/"),
-            "retargetCompletion": tc("call/retargetCompletion/"),
-            "transfer": tc("call/transfer/"),
-            "transferAcceptance": tc("call/transferAcceptance/"),
-            "transferCompletion": tc("call/transferCompletion/"),
-            "holdCompletion": tc("call/holdCompletion/"),
-            "resumeCompletion": tc("call/resumeCompletion/"),
-            "call": tc("call/updateMediaDescriptions"),
-            "monitorCompletion": tc("call/monitorCompletion/")
-        },
-        "clientContentForMediaController": {
-            "controlVideoStreaming": tc("call/controlVideoStreaming/"),
-            "csrcInfo": tc("call/csrcInfo/")
-        }
-    })
+pub async fn answer_media_renegotiation(
+    http: &reqwest::Client,
+    media_answer_url: &str,
+    params: &ConversationCallParams<'_>,
+    sdp_answer: &str,
+    media_leg_id: &str,
+) -> Result<()> {
+    let payload = microsoft_calling::media_renegotiation_answer_payload(sdp_answer, media_leg_id);
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let resp = call_controller_post(http, media_answer_url, params, &message_id)
+        .json(&payload)
+        .send()
+        .await
+        .context("Failed to POST media renegotiation answer")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        tracing::info!("Media renegotiation answered ({status})");
+        return Ok(());
+    }
+    anyhow::bail!("Media renegotiation answer failed ({status}): {body}")
 }
 
 /// Phase 3: Acknowledge call acceptance.
@@ -519,33 +349,37 @@ pub async fn acknowledge_call_acceptance(
     acknowledgement_url: &str,
     params: &ConversationCallParams<'_>,
 ) -> Result<()> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let payload = microsoft_calling::call_acceptance_acknowledgement_payload(&callback);
 
     tracing::info!(
         "Phase 3a: Acknowledging call acceptance -> POST {}",
         acknowledgement_url
     );
 
-    let resp = http
-        .post(acknowledgement_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", params.message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .json(&serde_json::json!({
-            "callAcceptanceAcknowledgement": cc_call_links(&tc)
-        }))
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let resp = call_controller_post(http, acknowledgement_url, params, &message_id)
+        .json(&payload)
         .send()
         .await
         .context("Failed to POST call acceptance acknowledgement")?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    if let Ok(path) = std::env::var("MICROSLOP_CALL_TRACE_PATH") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                file,
+                "# callAcceptanceAcknowledgement status={} body={}",
+                status, body
+            );
+        }
+    }
 
     if status.is_success() {
         tracing::info!("Call acceptance acknowledged ({}): {}", status, body);
@@ -569,12 +403,8 @@ pub async fn register_cc_callbacks(
     call_leg_url: &str,
     params: &ConversationCallParams<'_>,
 ) -> Result<()> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-
-    let payload = serde_json::json!({
-        "callAcceptanceAcknowledgement": cc_call_links(&tc),
-        "callParticipantUpdate": cc_call_links(&tc)
-    });
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let payload = microsoft_calling::cc_callback_registration_payload(&callback);
 
     tracing::info!(
         "Phase 3b: Registering CC callbacks -> POST {}",
@@ -585,17 +415,8 @@ pub async fn register_cc_callbacks(
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
 
-    let resp = http
-        .post(call_leg_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", params.message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let resp = call_controller_post(http, call_leg_url, params, &message_id)
         .json(&payload)
         .send()
         .await
@@ -612,17 +433,6 @@ pub async fn register_cc_callbacks(
     }
 }
 
-/// Echo bot MRI (Call Quality Tester).
-pub const ECHO_BOT_MRI: &str = "28:cf28171e-fcfd-47e4-a1d6-79460b0b3ca0";
-
-/// Echo bot OID (extracted from the MRI).
-const ECHO_BOT_OID: &str = "cf28171e-fcfd-47e4-a1d6-79460b0b3ca0";
-
-/// Build the 1:1 thread ID for a call to the Echo bot.
-pub fn echo_thread_id(caller_oid: &str) -> String {
-    format!("19:{}_{}@unq.gbl.spaces", caller_oid, ECHO_BOT_OID)
-}
-
 /// Create an Echo bot call in a single epconv POST (matching real Teams client flow).
 ///
 /// Unlike the two-phase approach for channel calls, the echo call embeds the SDP
@@ -633,114 +443,16 @@ pub async fn create_echo_call(
     params: &ConversationCallParams<'_>,
     sdp_offer: &str,
 ) -> Result<(ConversationCreated, ConversationJoined)> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-    let cause_id = &params.message_id[..8.min(params.message_id.len())];
-
-    let payload = serde_json::json!({
-        "conversationRequest": {
-            "conversationType": null,
-            "subject": "",
-            "suppressDialout": true,
-            "roster": {
-                "type": "Delta",
-                "rosterUpdate": tc("conversation/rosterUpdate/")
-            },
-            "properties": {
-                "allowConversationWithoutHost": true,
-                "enableGroupCallEventMessages": true,
-                "enableGroupCallUpgradeMessage": false,
-                "enableGroupCallMeetupGeneration": false
-            },
-            "links": {
-                "conversationEnd": tc("conversation/conversationEnd/"),
-                "conversationUpdate": tc("conversation/conversationUpdate/"),
-                "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
-                "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-                "addParticipantFailure": tc("conversation/addParticipantFailure/"),
-                "addModalitySuccess": tc("conversation/addModalitySuccess/"),
-                "addModalityFailure": tc("conversation/addModalityFailure/"),
-                "confirmUnmute": tc("conversation/confirmUnmute/"),
-                "receiveMessage": tc("conversation/receiveMessage/")
-            }
-        },
-        "scenario": "UserInitiatedTestCall",
-        "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
-        },
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": []
-        },
-        "capabilities": null,
-        "endpointCapabilities": 73463,
-        "clientEndpointCapabilities": 9336554,
-        "endpointMetadata": { "holographicCapabilities": 3 },
-        "meetingInfo": null,
-        "endpointState": {
-            "endpointStateSequenceNumber": 0,
-            "endpointProperties": {
-                "additionalEndpointProperties": {
-                    "infoShownInReportMode": "FullInformation"
-                }
-            }
-        },
-        "callInvitation": {
-            "callModalities": ["Audio", "Video", "ScreenViewer"],
-            "replaces": null,
-            "transferor": null,
-            "links": {
-                "progress": tc("call/progress/"),
-                "mediaAnswer": tc("call/mediaAnswer/"),
-                "acceptance": tc("call/acceptance/"),
-                "redirection": tc("call/redirection/"),
-                "end": tc("call/end/")
-            },
-            "clientContentForMediaController": {
-                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
-                "csrcInfo": tc("call/csrcInfo/"),
-                "dominantSpeakerInfo": tc("call/dominantSpeakerInfo/")
-            },
-            "pstnContent": {
-                "emergencyCallCountry": "",
-                "platformName": "teams-cli",
-                "publicApiCall": false
-            },
-            "mediaContent": {
-                "contentType": "application/sdp",
-                "blob": sdp_offer
-            }
-        },
-        "debugContent": {
-            "ecsEtag": "\"0\"",
-            "causeId": cause_id
-        }
-    });
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let payload =
+        microsoft_calling::echo_call_payload(&payload_context(params), &callback, sdp_offer);
 
     tracing::info!(
         "Echo call: POST {} (single-shot epconv with SDP, scenario=UserInitiatedTestCall)",
         epconv_url
     );
 
-    let resp = http
-        .post(epconv_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", params.message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
+    let resp = call_controller_post(http, epconv_url, params, params.message_id)
         .json(&payload)
         .send()
         .await
@@ -764,7 +476,6 @@ pub async fn create_echo_call(
         anyhow::bail!("Echo call epconv failed ({}): {}", status, body);
     }
 
-    // Parse conversationController from response
     let resp_json: serde_json::Value =
         serde_json::from_str(&body).context("Echo call response is not valid JSON")?;
 
@@ -781,10 +492,7 @@ pub async fn create_echo_call(
         })
         .context("No conversationController in echo call response")?;
 
-    let add_participant_url = resp_json
-        .pointer("/links/addParticipant")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let add_participant_url = response_link(&resp_json, "addParticipant").map(str::to_owned);
 
     tracing::info!(
         "Echo call: conversationController = {}, addParticipant link = {:?}",
@@ -792,10 +500,7 @@ pub async fn create_echo_call(
         add_participant_url
     );
 
-    let cc_active_url = resp_json
-        .pointer("/links/active")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let cc_active_url = response_link(&resp_json, "active").map(str::to_owned);
 
     let created = ConversationCreated {
         conversation_controller: conv_controller,
@@ -817,94 +522,69 @@ pub async fn create_echo_call(
 pub async fn invite_echo_bot(
     http: &reqwest::Client,
     conversation_controller: &str,
+    add_participant_url: Option<&str>,
     params: &ConversationCallParams<'_>,
 ) -> Result<()> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-
-    // Derive /add URL from conversation controller
-    let add_url = if let Some(idx) = conversation_controller.find('?') {
-        let (path, query) = conversation_controller.split_at(idx);
-        format!("{}/add{}", path.trim_end_matches('/'), query)
-    } else {
-        format!("{}/add", conversation_controller.trim_end_matches('/'))
-    };
-
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let fallback_url = microsoft_calling::echo_bot_invite_url(conversation_controller);
+    let mut add_urls = Vec::with_capacity(2);
+    if let Some(url) = add_participant_url {
+        add_urls.push(url.to_owned());
+    }
+    if add_urls.first() != Some(&fallback_url) {
+        add_urls.push(fallback_url);
+    }
     let echo_participant_id = uuid::Uuid::new_v4().to_string();
-
-    let payload = serde_json::json!({
-        "disableUnmute": false,
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": [{
-                "id": ECHO_BOT_MRI,
-                "participantId": echo_participant_id
-            }]
-        },
-        "participantInvitationData": {},
-        "replacementDetails": null,
-        "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
-        },
-        "links": {
-            "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-            "addParticipantFailure": tc("conversation/addParticipantFailure/")
-        }
-    });
-
-    // Fresh message-id: the conv server uses this for deduplication; reusing the
-    // epconv message-id would cause a cached empty response.
-    let echo_bot_msg_id = uuid::Uuid::new_v4().to_string();
-
-    tracing::info!(
-        "Inviting Echo bot -> POST {} (msg_id={})",
-        add_url,
-        echo_bot_msg_id
+    let payload = microsoft_calling::echo_bot_invite_payload(
+        &payload_context(params),
+        &callback,
+        &echo_participant_id,
     );
+
     tracing::debug!(
         "Echo bot invite payload: {}",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
 
-    let resp = http
-        .post(&add_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", &echo_bot_msg_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
-        .json(&payload)
-        .send()
-        .await
-        .context("Failed to POST echo bot invite")?;
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    tracing::info!(
-        "Echo bot invite response: {} ({} bytes)",
-        status,
-        body.len()
-    );
-    tracing::debug!("Echo bot invite response body: {}", body);
-
-    if !status.is_success() {
-        anyhow::bail!("Echo bot invite failed ({}): {}", status, body);
+    for (index, add_url) in add_urls.iter().enumerate() {
+        let echo_bot_msg_id = uuid::Uuid::new_v4().to_string();
+        tracing::info!(
+            "Inviting Echo bot -> POST {} (msg_id={})",
+            add_url,
+            echo_bot_msg_id
+        );
+        let resp = call_controller_post(http, add_url, params, &echo_bot_msg_id)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to POST echo bot invite")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::info!(
+            "Echo bot invite response: {} ({} bytes)",
+            status,
+            body.len()
+        );
+        tracing::debug!("Echo bot invite response body: {}", body);
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::NOT_FOUND && index + 1 < add_urls.len() {
+            tracing::warn!(
+                "Echo bot invite endpoint {} returned 404; retrying fallback",
+                add_url
+            );
+            continue;
+        }
+        anyhow::bail!(
+            "Echo bot invite failed at {} ({}): {}",
+            add_url,
+            status,
+            body
+        );
     }
 
-    Ok(())
+    anyhow::bail!("No Echo bot invite endpoint is available")
 }
 
 /// Create a 1:1 call in a single epconv POST.
@@ -916,118 +596,55 @@ pub async fn create_1to1_call(
     epconv_url: &str,
     params: &ConversationCallParams<'_>,
     sdp_offer: &str,
+    callee_mri: Option<&str>,
+    include_video: bool,
 ) -> Result<(ConversationCreated, ConversationJoined)> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-    let cause_id = &params.message_id[..8.min(params.message_id.len())];
-
-    let payload = serde_json::json!({
-        "conversationRequest": {
-            "conversationType": null,
-            "subject": "",
-            "suppressDialout": false,  // false = ring the callee
-            "roster": {
-                "type": "Delta",
-                "rosterUpdate": tc("conversation/rosterUpdate/")
-            },
-            "properties": {
-                "allowConversationWithoutHost": true,
-                "enableGroupCallEventMessages": true,
-                "enableGroupCallUpgradeMessage": false,
-                "enableGroupCallMeetupGeneration": false
-            },
-            "links": {
-                "conversationEnd": tc("conversation/conversationEnd/"),
-                "conversationUpdate": tc("conversation/conversationUpdate/"),
-                "localParticipantUpdate": tc("conversation/localParticipantUpdate/"),
-                "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-                "addParticipantFailure": tc("conversation/addParticipantFailure/"),
-                "addModalitySuccess": tc("conversation/addModalitySuccess/"),
-                "addModalityFailure": tc("conversation/addModalityFailure/"),
-                "confirmUnmute": tc("conversation/confirmUnmute/"),
-                "receiveMessage": tc("conversation/receiveMessage/")
-            }
-        },
-        "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
-        },
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": []
-        },
-        "capabilities": null,
-        "endpointCapabilities": 73463,
-        "clientEndpointCapabilities": 9336554,
-        "endpointMetadata": { "holographicCapabilities": 3 },
-        "meetingInfo": null,
-        "endpointState": {
-            "endpointStateSequenceNumber": 0,
-            "endpointProperties": {
-                "additionalEndpointProperties": {
-                    "infoShownInReportMode": "FullInformation"
-                }
-            }
-        },
-        "callInvitation": {
-            "callModalities": ["Audio", "Video", "ScreenViewer"],
-            "replaces": null,
-            "transferor": null,
-            "links": {
-                "progress": tc("call/progress/"),
-                "mediaAnswer": tc("call/mediaAnswer/"),
-                "acceptance": tc("call/acceptance/"),
-                "redirection": tc("call/redirection/"),
-                "end": tc("call/end/")
-            },
-            "clientContentForMediaController": {
-                "controlVideoStreaming": tc("call/controlVideoStreaming/"),
-                "csrcInfo": tc("call/csrcInfo/"),
-                "dominantSpeakerInfo": tc("call/dominantSpeakerInfo/")
-            },
-            "pstnContent": {
-                "emergencyCallCountry": "",
-                "platformName": "teams-cli",
-                "publicApiCall": false
-            },
-            "mediaContent": {
-                "contentType": "application/sdp",
-                "blob": sdp_offer
-            }
-        },
-        "debugContent": {
-            "ecsEtag": "\"0\"",
-            "causeId": cause_id
-        }
-    });
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let payload = if params.personal {
+        let callee_mri = callee_mri.context("Personal 1:1 calls require a callee MRI")?;
+        let callee_participant_id = uuid::Uuid::new_v4().to_string();
+        let media_leg_id = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+        microsoft_calling::personal_one_to_one_call_payload(
+            &payload_context(params),
+            &callback,
+            sdp_offer,
+            callee_mri,
+            &callee_participant_id,
+            &media_leg_id,
+            include_video,
+        )
+    } else {
+        microsoft_calling::one_to_one_call_payload(
+            &payload_context(params),
+            &callback,
+            sdp_offer,
+            callee_mri,
+            include_video,
+        )
+    };
 
     tracing::info!(
-        "1:1 call: POST {} (single-shot epconv with SDP)",
-        epconv_url
+        "1:1 call: POST {} (direct peer in initial epconv, video={})",
+        epconv_url,
+        include_video
     );
 
-    let resp = http
-        .post(epconv_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", params.message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
-        .json(&payload)
-        .send()
-        .await
-        .context("1:1 call POST to epconv failed")?;
+    let mut attempt = 0u8;
+    let resp = loop {
+        attempt += 1;
+        let result = call_controller_post(http, epconv_url, params, params.message_id)
+            .json(&payload)
+            .send()
+            .await;
+        match result {
+            Ok(response) => break response,
+            Err(error) if attempt < 3 => {
+                tracing::warn!("1:1 epconv transport failed on attempt {attempt}: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
+            }
+            Err(error) => return Err(error).context("1:1 call POST to epconv failed"),
+        }
+    };
 
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -1040,7 +657,6 @@ pub async fn create_1to1_call(
         anyhow::bail!("1:1 call epconv failed ({}): {}", status, body);
     }
 
-    // Parse conversationController from response
     let resp_json: serde_json::Value =
         serde_json::from_str(&body).context("1:1 call response is not valid JSON")?;
 
@@ -1057,10 +673,7 @@ pub async fn create_1to1_call(
         })
         .context("No conversationController in 1:1 call response")?;
 
-    let add_participant_url = resp_json
-        .pointer("/links/addParticipant")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let add_participant_url = response_link(&resp_json, "addParticipant").map(str::to_owned);
 
     tracing::info!(
         "1:1 call: conversationController = {}, addParticipant link = {:?}",
@@ -1068,10 +681,7 @@ pub async fn create_1to1_call(
         add_participant_url
     );
 
-    let cc_active_url = resp_json
-        .pointer("/links/active")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let cc_active_url = response_link(&resp_json, "active").map(str::to_owned);
 
     let created = ConversationCreated {
         conversation_controller: conv_controller,
@@ -1086,115 +696,61 @@ pub async fn create_1to1_call(
     Ok((created, joined))
 }
 
-/// Invite a user into the conversation via POST /conv/{id}/add.
-///
-/// This is step 3 of the 1:1 call flow: after creating the conversation (epconv)
-/// and joining with SDP, we add the callee as a participant.
-///
-/// If `include_video` is true, the call invitation will include Video modality.
 pub async fn invite_user(
     http: &reqwest::Client,
     conversation_controller: &str,
+    add_participant_url: Option<&str>,
     params: &ConversationCallParams<'_>,
     callee_mri: &str,
     include_video: bool,
 ) -> Result<()> {
-    let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
-
-    // Derive /add URL from conversation controller
-    let add_url = if let Some(idx) = conversation_controller.find('?') {
-        let (path, query) = conversation_controller.split_at(idx);
-        format!("{}/add{}", path.trim_end_matches('/'), query)
-    } else {
-        format!("{}/add", conversation_controller.trim_end_matches('/'))
-    };
-
+    let callback = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
+    let fallback_url = microsoft_calling::user_invite_url(conversation_controller);
+    let mut add_urls = Vec::with_capacity(2);
+    if let Some(url) = add_participant_url {
+        add_urls.push(url.to_owned());
+    }
+    if add_urls.first() != Some(&fallback_url) {
+        add_urls.push(fallback_url);
+    }
     let callee_participant_id = uuid::Uuid::new_v4().to_string();
-    let call_modalities: Vec<&str> = if include_video {
-        vec!["Audio", "Video"]
-    } else {
-        vec!["Audio"]
-    };
-
-    let payload = serde_json::json!({
-        "disableUnmute": false,
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.caller_display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": [{
-                "id": callee_mri,
-                "participantId": callee_participant_id
-            }]
-        },
-        // Include call invitation data to trigger ringing on callee's device
-        "participantInvitationData": {
-            "callModalities": call_modalities,
-            "callDirection": "Outgoing"
-        },
-        "callInvitation": {
-            "callModalities": call_modalities,
-            "replaces": null,
-            "transferor": null
-        },
-        "replacementDetails": null,
-        "groupContext": null,
-        "groupChat": {
-            "threadId": params.thread_id,
-            "messageId": null
-        },
-        "links": {
-            "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-            "addParticipantFailure": tc("conversation/addParticipantFailure/")
-        }
-    });
-
-    // Fresh message-id for deduplication
-    let invite_msg_id = uuid::Uuid::new_v4().to_string();
-
-    tracing::info!(
-        "Inviting user {} -> POST {} (msg_id={})",
+    let payload = microsoft_calling::user_invite_payload(
+        &payload_context(params),
+        &callback,
         callee_mri,
-        add_url,
-        invite_msg_id
+        &callee_participant_id,
+        include_video,
     );
-    tracing::debug!(
-        "User invite payload: {}",
-        serde_json::to_string_pretty(&payload).unwrap_or_default()
-    );
-
-    let resp = http
-        .post(&add_url)
-        .header("Authorization", format!("Bearer {}", params.ic3_token))
-        .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", &invite_msg_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("Referer", "https://teams.microsoft.com/")
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
-        .json(&payload)
-        .send()
-        .await
-        .context("Failed to POST user invite")?;
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    tracing::info!("User invite response: {} ({} bytes)", status, body.len());
-    tracing::debug!("User invite response body: {}", body);
-
-    if !status.is_success() {
-        anyhow::bail!("User invite failed ({}): {}", status, body);
+    for (index, add_url) in add_urls.iter().enumerate() {
+        let invite_msg_id = uuid::Uuid::new_v4().to_string();
+        tracing::info!(
+            "Inviting user {} -> POST {} (msg_id={})",
+            callee_mri,
+            add_url,
+            invite_msg_id
+        );
+        let resp = call_controller_post(http, add_url, params, &invite_msg_id)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to POST user invite")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::info!("User invite response: {} ({} bytes)", status, body.len());
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::NOT_FOUND && index + 1 < add_urls.len() {
+            tracing::warn!(
+                "User invite endpoint {} returned 404; retrying fallback",
+                add_url
+            );
+            continue;
+        }
+        anyhow::bail!("User invite failed at {} ({}): {}", add_url, status, body);
     }
 
-    Ok(())
+    anyhow::bail!("No user invite endpoint is available")
 }
 
 /// End a call by POSTing to the end URL.
@@ -1203,23 +759,24 @@ pub async fn end_call(
     skype_token: &str,
     notification: &CallNotification,
 ) -> Result<()> {
-    let invitation = notification
+    let end_url = notification
         .call_invitation
         .as_ref()
         .context("No callInvitation in notification")?;
-    let links = invitation
+    let end_url = end_url
         .links
         .as_ref()
         .context("No links in callInvitation")?;
-    let end_url = links.end.as_ref().context("No end URL in links")?;
+    let end_url = end_url
+        .end
+        .as_ref()
+        .context("No end URL in links")?
+        .to_owned();
 
     tracing::info!("Ending call -> POST {}", end_url);
 
-    let resp = http
-        .post(end_url)
-        .header("X-Skypetoken", skype_token)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({}))
+    let resp = skype_post(http, &end_url, skype_token)
+        .json(&microsoft_calling::end_call_payload())
         .send()
         .await
         .context("Failed to POST end call")?;
@@ -1232,5 +789,42 @@ pub async fn end_call(
         Ok(())
     } else {
         anyhow::bail!("Call end failed ({}): {}", status, body);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_link;
+
+    #[test]
+    fn response_link_reads_root_and_wrapped_links() {
+        let root = serde_json::json!({
+            "links": {
+                "addParticipant": "https://root/add",
+                "active": "https://root/active"
+            }
+        });
+        let wrapped = serde_json::json!({
+            "conversationResponse": {
+                "links": {
+                    "addParticipant": "https://wrapped/add",
+                    "active": "https://wrapped/active"
+                }
+            }
+        });
+
+        assert_eq!(
+            response_link(&root, "addParticipant"),
+            Some("https://root/add")
+        );
+        assert_eq!(response_link(&root, "active"), Some("https://root/active"));
+        assert_eq!(
+            response_link(&wrapped, "addParticipant"),
+            Some("https://wrapped/add")
+        );
+        assert_eq!(
+            response_link(&wrapped, "active"),
+            Some("https://wrapped/active")
+        );
     }
 }

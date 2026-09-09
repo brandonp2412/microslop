@@ -50,18 +50,29 @@ check: fmt-check lint
 test:
     cargo test
 
-# Run e2e tests (requires valid login session)
-e2e: build
-    ./tests/e2e_trouter.sh
-    ./tests/e2e_read.sh
-    ./tests/e2e_chats.sh
-    ./tests/e2e_teams.sh
+# Run the maintained live-account suite (requires an unlocked login session).
+# MICROSLOP_E2E_SELF_CHAT must name the 1:1 chat used for safe CUD checks.
+e2e:
+    test -n "$MICROSLOP_E2E_SELF_CHAT"
+    cd app && DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" flutter test integration_test/live_account_e2e_test.dart -d linux --dart-define="MICROSLOP_E2E_SELF_CHAT=$MICROSLOP_E2E_SELF_CHAT" --dart-define=MICROSLOP_E2E_PLATFORM=linux
 
-# Run call test (requires valid login + call service access)
-e2e-call: build
-    ./tests/e2e_echo123.sh
+screenshots:
+    app/tool/capture_ui_screenshots.sh
+
+# Run deterministic Echo audio transport test (requires valid login)
+e2e-call: build-audio
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" ./target/debug/teams-cli call-test --echo --tone --duration 20
+
+# Run live Echo audio/video test (requires camera, display, and valid login)
+e2e-call-video: build-full
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" ./target/debug/teams-cli call-test --echo --camera --display --duration 20
 
 # --- Run ---
+
+# Launch Flutter against the real desktop session bus. This avoids isolated
+# D-Bus/keyring sessions when invoked by automation or editor terminals.
+app-linux:
+    cd app && DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" flutter run -d linux
 
 # Show CLI help
 help:
@@ -69,27 +80,27 @@ help:
 
 # Login with device code flow
 login:
-    cargo run -- login
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" cargo run -- login
 
 # Show authentication status
 status:
-    cargo run -- status
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" cargo run -- status
 
 # Show current user info
 whoami:
-    cargo run -- whoami
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" cargo run -- whoami
 
 # List recent chats
 chats:
-    cargo run -- chats
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" cargo run -- chats
 
 # List joined teams and channels
 teams:
-    cargo run -- teams
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" cargo run -- teams
 
 # Connect to Trouter for real-time notifications
 trouter:
-    cargo run -- trouter
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" cargo run -- trouter
 
 # --- Audio/Video ---
 
@@ -103,7 +114,7 @@ cam-test: build-video
 
 # Place audio call to Echo bot (20s)
 call-echo: build-audio
-    ./target/debug/teams-cli call-test --echo --duration 20
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" ./target/debug/teams-cli call-test --echo --duration 20
 
 # --- TUI ---
 
@@ -113,4 +124,4 @@ tui: build
 
 # Place A/V call to Echo bot with camera and display (20s)
 call-echo-video: build-full
-    ./target/debug/teams-cli call-test --echo --camera --display --duration 20
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" ./target/debug/teams-cli call-test --echo --camera --display --duration 20

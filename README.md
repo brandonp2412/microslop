@@ -1,10 +1,35 @@
-# OST client := Open Source Teams client
+# Microslop
 
-A command-line client for Microsoft Teams written in Rust.
+A Microsoft Teams client built with Flutter and Rust, with native desktop and Android integrations.
 
-*Ost* means cheese in Danish.
+Microslop is a fork and continuation of [eisbaw/ost](https://github.com/eisbaw/ost), with Git ancestry preserved from OST commit `089214470ce0cea1c30d57ede54da07121ef71ec`.
 
-![OST Logo](docs/logo_ost.jpg)
+## Flutter client
+
+The Flutter application lives in `app`. It exposes a work/school account device-code login and a messaging workspace for teams, channels, and chats, backed by Rust through `flutter_rust_bridge`.
+
+- Rust owns the Microsoft device-code request, token exchange, and secret persistence.
+- Flutter receives only the verification address, user code, and safe sign-in state.
+- The Microsoft refresh token is written to platform secure storage; Teams, Skype, Graph, and IC3 access tokens stay in Rust memory and are never returned to Dart.
+- After sign-in, Flutter loads joined teams, channels, chats, and message history through Rust. It can send messages/files, react, mark chats read, receive live updates, and place or receive one-to-one calls.
+- Android integrates native call audio routing, camera capture, and remote H.264 video rendering. Incoming caller video is currently receive-only, so answering does not automatically enable the local camera.
+
+Run the application from `app` after enabling platform prerequisites:
+
+```bash
+flutter pub get
+flutter run -d windows
+```
+
+The bridge generator is version 2.13.0. Regenerate bindings from `app` after changing the Rust bridge API:
+
+```bash
+flutter_rust_bridge_codegen generate --rust-root rust --rust-input crate::api --dart-output lib/src/rust
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the application boundaries and current scope.
+
+![Microslop logo](app/assets/icon/app_icon.png)
 
 ![TUI Screenshot](docs/tui-screenshot.svg)
 
@@ -15,9 +40,9 @@ A command-line client for Microsoft Teams written in Rust.
 - **Messaging**: List chats, read messages, send messages (stable)
 - **Teams**: List joined teams and channels (stable)
 - **Real-time**: WebSocket connection for push notifications (Trouter)
-- **Calling**: Audio and video calls with RTP/SRTP media
-- **Audio** (optional): Microphone capture and speaker playback (working)
-- **Video** (optional): Camera capture via V4L2 and SDL2 display (WIP)
+- **Calling**: One-to-one audio/video signaling with ICE, RTP/RTCP, and SRTP media
+- **Audio** (optional): Microphone capture and speaker playback
+- **Video** (optional): H.264 codec path, Android native camera/rendering, and Linux V4L2/SDL2 tooling
 
 ## Status
 
@@ -28,15 +53,15 @@ A command-line client for Microsoft Teams written in Rust.
 | Chat / Messaging | Stable |
 | Teams / Channels | Stable |
 | Trouter (push) | Stable |
-| Audio calls | Working |
-| Video calls | WIP - may cause audio issues |
+| Audio calls | Working; Microsoft Test Call covered |
+| Video calls | Partial; outgoing/test paths covered, incoming receive path still needs real-person E2E |
 
-**Note**: Video support is work-in-progress. Building with `--features video-capture` may interfere with audio functionality. For reliable audio calls, use `--features audio` only.
+**Note**: Calling uses reverse-engineered Teams signaling. TURN relay support and some ICE edge cases remain incomplete, so restrictive networks can still expose failures not seen in local or Test Call validation.
 
 ## Requirements
 
-- Rust 1.70+ (some dependencies are pinned for compatibility with older rustc versions)
-- Linux (for audio/video features)
+- Rust 1.85+ (the workspace includes Rust 2024 edition crates)
+- Linux for the CLI V4L2/SDL2 media tools; Android for the Flutter native camera and remote-video surface
 - Nix (recommended) or manual dependency installation
 - [just](https://github.com/casey/just) command runner (optional, for convenience recipes)
 
@@ -188,7 +213,6 @@ Commands:
              --to ID    Chat ID to send to
   teams      List joined teams and channels
   tui        Launch interactive terminal user interface
-  presence   Get/set presence status
   trouter    Connect to push notification service
   call-test  Place a test call
              --echo       Call the Echo bot (call quality tester)
@@ -216,6 +240,11 @@ cargo test
 
 ### End-to-End Tests
 
+Live audio and video calling tests are documented in
+[docs/calling-e2e.md](docs/calling-e2e.md). Workspace persistence and bounded
+message prefetch decisions are documented in
+[docs/workspace-navigation-and-prefetch.md](docs/workspace-navigation-and-prefetch.md).
+
 E2E tests require a valid login session. Run all e2e tests:
 
 ```bash
@@ -224,13 +253,13 @@ just e2e
 
 Individual e2e tests:
 
-| Test | Description |
-|------|-------------|
-| `tests/e2e_trouter.sh` | Trouter WebSocket connection |
-| `tests/e2e_chats.sh` | Chat listing |
-| `tests/e2e_read.sh` | Message reading |
-| `tests/e2e_teams.sh` | Teams/channels listing |
-| `tests/e2e_echo123.sh` | Echo bot call test |
+| Command | Description |
+|---------|-------------|
+| `just e2e-call` | Deterministic audio transport test with the Echo bot |
+| `just e2e-call-video` | Live camera/display test with the Echo bot |
+| `just call-echo` | Interactive microphone/speaker Echo call |
+| `just mic-test` | Local microphone capture and playback |
+| `just cam-test` | Local camera capture and display |
 
 ### Quality Checks
 

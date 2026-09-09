@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/chromium --headless=new --disable-gpu --no-sandbox "$@"

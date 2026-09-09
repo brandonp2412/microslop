@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 use crate::auth::{StoredToken, TokenStore};
 
-/// Application configuration
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    pub personal: bool,
     /// Stored AAD access token (audience: api.spaces.skype.com)
     pub access_token: Option<StoredToken>,
     /// Stored AAD refresh token
@@ -30,19 +30,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Get config directory path
     fn config_dir() -> Result<PathBuf> {
         let proj_dirs = ProjectDirs::from("com", "teams-cli", "teams-cli")
             .context("Could not determine config directory")?;
         Ok(proj_dirs.config_dir().to_path_buf())
     }
 
-    /// Get config file path
     fn config_path() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("config.toml"))
     }
 
-    /// Load configuration from disk
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
 
@@ -54,7 +51,6 @@ impl Config {
         toml::from_str(&content).context("Failed to parse config file")
     }
 
-    /// Save configuration to disk
     pub fn save(&self) -> Result<()> {
         let dir = Self::config_dir()?;
         fs::create_dir_all(&dir).context("Failed to create config directory")?;

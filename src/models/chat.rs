@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Chat type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatType {
@@ -11,7 +10,6 @@ pub enum ChatType {
     Meeting,
 }
 
-/// Chat entity
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {

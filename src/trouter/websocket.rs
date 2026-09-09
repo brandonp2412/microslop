@@ -2,6 +2,8 @@
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
+use ost_microsoft::calling as microsoft_calling;
+use tokio::{time, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::session::SessionResponse;
@@ -11,6 +13,7 @@ type WsStream =
 
 pub struct TrouterSocket {
     stream: WsStream,
+    heartbeat: time::Interval,
 }
 
 impl TrouterSocket {
@@ -32,10 +35,15 @@ impl TrouterSocket {
 
         tracing::info!("WebSocket connected (status={})", response.status());
 
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            heartbeat: time::interval_at(
+                time::Instant::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
+            ),
+        })
     }
 
-    /// Send a text frame.
     pub async fn send_text(&mut self, msg: &str) -> Result<()> {
         tracing::debug!("WS send: {}", msg);
         self.stream
@@ -44,7 +52,17 @@ impl TrouterSocket {
             .context("Failed to send WebSocket message")
     }
 
-    /// Receive the next text frame, ignoring pings/pongs.
+    pub async fn authenticate(
+        &mut self,
+        access_token: &str,
+        session: &SessionResponse,
+    ) -> Result<()> {
+        let authentication =
+            microsoft_calling::authentication_payload(access_token, &session.connectparams);
+        self.send_text(&format!("5:::{authentication}")).await?;
+        self.send_text(microsoft_calling::ACTIVE_FRAME).await
+    }
+
     ///
     /// Automatically sends HTTP 200 responses for Trouter data frame deliveries.
     /// Trouter uses HTTP-over-WebSocket: each `3:::` data frame contains an `"id"` field.
@@ -53,11 +71,20 @@ impl TrouterSocket {
     /// which kills calls with error 430/10065.
     pub async fn recv_frame(&mut self) -> Result<Option<String>> {
         loop {
-            match self.stream.next().await {
+            let next = tokio::select! {
+                frame = self.stream.next() => frame,
+                _ = self.heartbeat.tick() => {
+                    self.stream
+                        .send(Message::Text("2::".to_string()))
+                        .await
+                        .context("Heartbeat send failed")?;
+                    continue;
+                }
+            };
+            match next {
                 Some(Ok(Message::Text(text))) => {
                     tracing::debug!("WS recv: {}", text);
 
-                    // Auto-respond to Trouter data frame deliveries (3::: HTTP-over-WS)
                     if let Some(req_id) = extract_trouter_request_id(&text) {
                         let resp = format!("3:::{{\"id\":{},\"status\":200}}", req_id);
                         tracing::debug!("Trouter response: {}", resp);
@@ -66,10 +93,8 @@ impl TrouterSocket {
                         }
                     }
 
-                    // Auto-ack Socket.IO event frames (5:ID::)
                     // Without acks, the server retries indefinitely and blocks new events.
-                    if let Some(ack_id) = extract_socketio_ack_id(&text) {
-                        let ack = format!("6:{}::", ack_id);
+                    if let Some(ack) = microsoft_calling::socketio_acknowledgement(&text) {
                         tracing::debug!("Socket.IO ack: {}", ack);
                         if let Err(e) = self.stream.send(Message::Text(ack)).await {
                             tracing::warn!("Failed to send Socket.IO ack: {:#}", e);
@@ -108,21 +133,6 @@ impl TrouterSocket {
 /// Only `3:::` frames use this mechanism; `5:` event frames use Socket.IO acks instead.
 fn extract_trouter_request_id(frame: &str) -> Option<i64> {
     let json_str = frame.strip_prefix("3:::")?;
-    // Fast path: find "id": near the start of JSON to avoid full parse
     let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
     v.get("id").and_then(|id| id.as_i64())
-}
-
-/// Extract Socket.IO event ack ID from a `5:ID::` frame.
-///
-/// Socket.IO v1 event frames have format `5:ACK_ID:ENDPOINT:JSON`.
-/// Returns the numeric ack ID if present.
-fn extract_socketio_ack_id(frame: &str) -> Option<u64> {
-    let rest = frame.strip_prefix("5:")?;
-    let colon_pos = rest.find(':')?;
-    let id_part = &rest[..colon_pos];
-    if id_part.is_empty() {
-        return None;
-    }
-    id_part.parse().ok()
 }

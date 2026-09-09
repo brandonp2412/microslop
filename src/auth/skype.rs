@@ -5,12 +5,15 @@
 //! actually require for most operations.
 
 use anyhow::{bail, Context, Result};
+use ost_microsoft::auth as microsoft_auth;
 use serde::Deserialize;
 
 /// Response from Teams authsvc token exchange
 #[derive(Debug, Deserialize)]
 pub struct AuthzResponse {
     pub tokens: Option<AuthzTokens>,
+    #[serde(rename = "skypeToken")]
+    pub personal_token: Option<PersonalAuthzTokens>,
     #[serde(rename = "regionGtms")]
     pub region_gtms: Option<serde_json::Value>,
 }
@@ -23,8 +26,12 @@ pub struct AuthzTokens {
     pub expires_in: Option<u64>,
 }
 
-const AUTHZ_URL_WORK: &str = "https://teams.microsoft.com/api/authsvc/v1.0/authz";
-const AUTHZ_URL_PERSONAL: &str = "https://teams.live.com/api/auth/v1.0/authz/consumer";
+#[derive(Debug, Deserialize)]
+pub struct PersonalAuthzTokens {
+    pub skypetoken: Option<String>,
+    #[serde(rename = "expiresIn")]
+    pub expires_in: Option<u64>,
+}
 
 /// Exchange an AAD access token for a Skype token.
 /// Returns (skype_token, expires_in_secs, region_gtms).
@@ -33,9 +40,9 @@ pub async fn exchange_skype_token(
     personal: bool,
 ) -> Result<(String, Option<u64>, Option<serde_json::Value>)> {
     let url = if personal {
-        AUTHZ_URL_PERSONAL
+        microsoft_auth::PERSONAL_AUTHZ_URL
     } else {
-        AUTHZ_URL_WORK
+        microsoft_auth::WORK_AUTHZ_URL
     };
 
     tracing::debug!("Exchanging AAD token for Skype token at {}", url);
@@ -64,12 +71,23 @@ pub async fn exchange_skype_token(
         .await
         .context("Failed to parse authsvc response")?;
 
-    let tokens = authz
-        .tokens
-        .context("authsvc response missing 'tokens' field")?;
-    let skype_token = tokens
-        .skype_token
-        .context("authsvc response missing 'skypeToken'")?;
+    let (skype_token, expires_in) = if let Some(tokens) = authz.tokens {
+        (
+            tokens
+                .skype_token
+                .context("authsvc response missing 'skypeToken'")?,
+            tokens.expires_in,
+        )
+    } else if let Some(tokens) = authz.personal_token {
+        (
+            tokens
+                .skypetoken
+                .context("personal authz response missing 'skypetoken'")?,
+            tokens.expires_in,
+        )
+    } else {
+        bail!("authsvc response missing Skype token");
+    };
 
-    Ok((skype_token, tokens.expires_in, authz.region_gtms))
+    Ok((skype_token, expires_in, authz.region_gtms))
 }

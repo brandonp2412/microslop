@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use openh264::decoder::{Decoder, DecoderConfig};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod};
 use openh264::formats::YUVSource;
 use openh264::OpenH264API;
 
@@ -46,7 +46,6 @@ pub struct DecodedFrame {
     pub data: Vec<u8>,
 }
 
-/// H.264 encoder wrapper.
 pub struct H264Encoder {
     encoder: Encoder,
     width: u32,
@@ -54,12 +53,14 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    /// Create a new encoder for the given resolution.
     pub fn new(width: u32, height: u32, fps: f32, bitrate_kbps: u32) -> Result<Self> {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
             .max_frame_rate(FrameRate::from_hz(fps))
-            .bitrate(BitRate::from_bps(bitrate_kbps * 1000));
+            .bitrate(BitRate::from_bps(bitrate_kbps * 1000))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(
+                (fps.max(1.0) * 2.0).round() as u32,
+            ));
 
         let encoder =
             Encoder::with_api_config(api, config).context("Failed to create openh264 encoder")?;
@@ -69,6 +70,10 @@ impl H264Encoder {
             width,
             height,
         })
+    }
+
+    pub fn force_intra_frame(&mut self) {
+        self.encoder.force_intra_frame();
     }
 
     /// Encode a raw I420 YUV frame into H.264 NAL units.
@@ -95,7 +100,6 @@ impl H264Encoder {
             .encode(&yuv)
             .context("openh264 encode failed")?;
 
-        // Extract NAL units from the encoded bitstream
         let mut nals = Vec::new();
         for layer_idx in 0..bitstream.num_layers() {
             let layer = bitstream.layer(layer_idx);
@@ -116,9 +120,9 @@ impl H264Encoder {
     }
 }
 
-/// H.264 decoder wrapper.
 pub struct H264Decoder {
     decoder: Decoder,
+    annexb: Vec<u8>,
 }
 
 impl H264Decoder {
@@ -126,29 +130,29 @@ impl H264Decoder {
         let api = OpenH264API::from_source();
         let decoder = Decoder::with_api_config(api, DecoderConfig::new())
             .context("Failed to create openh264 decoder")?;
-        Ok(Self { decoder })
+        Ok(Self {
+            decoder,
+            annexb: Vec::new(),
+        })
     }
 
-    /// Decode a single H.264 NAL unit.
     ///
     /// Returns a decoded YUV frame if the decoder produced output, None if
     /// it needs more data (e.g., SPS/PPS before IDR).
     pub fn decode(&mut self, nal: &[u8]) -> Result<Option<DecodedFrame>> {
-        // openh264 expects NAL units with Annex B start codes
-        let mut annexb = vec![0x00, 0x00, 0x00, 0x01];
-        annexb.extend_from_slice(nal);
+        self.annexb.clear();
+        self.annexb.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        self.annexb.extend_from_slice(nal);
 
-        match self.decoder.decode(&annexb) {
+        match self.decoder.decode(&self.annexb) {
             Ok(Some(yuv)) => {
                 let (w, h) = yuv.dimensions();
                 let (y_stride, u_stride, v_stride) = yuv.strides();
 
-                // Extract I420 planes
                 let y_size = w * h;
                 let uv_size = (w / 2) * (h / 2);
                 let mut data = vec![0u8; y_size + uv_size * 2];
 
-                // Copy Y plane (stride may be wider than width due to padding)
                 for row in 0..h {
                     let src_start = row * y_stride;
                     let dst_start = row * w;
@@ -156,7 +160,6 @@ impl H264Decoder {
                         .copy_from_slice(&yuv.y()[src_start..src_start + w]);
                 }
 
-                // Copy U plane
                 let half_w = w / 2;
                 let half_h = h / 2;
                 for row in 0..half_h {
@@ -166,7 +169,6 @@ impl H264Decoder {
                         .copy_from_slice(&yuv.u()[src_start..src_start + half_w]);
                 }
 
-                // Copy V plane
                 for row in 0..half_h {
                     let src_start = row * v_stride;
                     let dst_start = y_size + uv_size + row * half_w;
@@ -183,7 +185,7 @@ impl H264Decoder {
             Ok(None) => Ok(None),
             Err(e) => {
                 tracing::debug!("openh264 decode error: {:?}", e);
-                Ok(None) // Don't bail -- decoder may recover on next NAL
+                Ok(None)
             }
         }
     }
@@ -197,5 +199,67 @@ fn strip_start_code(data: &[u8]) -> &[u8] {
         &data[3..]
     } else {
         data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray_i420(width: usize, height: usize) -> Vec<u8> {
+        let mut frame = vec![128; width * height * 3 / 2];
+        frame[..width * height].fill(16);
+        frame
+    }
+
+    #[test]
+    fn encoder_emits_periodic_idr_frames() {
+        let mut encoder = H264Encoder::new(64, 64, 30.0, 256).unwrap();
+        let frame = gray_i420(64, 64);
+        let mut idr_frames = 0;
+
+        for _ in 0..65 {
+            let nals = encoder.encode(&frame).unwrap();
+            if nals
+                .iter()
+                .any(|nal| nal.first().is_some_and(|byte| byte & 0x1f == 5))
+            {
+                idr_frames += 1;
+            }
+        }
+
+        assert!(idr_frames >= 2, "expected startup and periodic IDR frames");
+    }
+
+    #[test]
+    fn encoder_emits_constrained_baseline_sps() {
+        let mut encoder = H264Encoder::new(64, 64, 30.0, 256).unwrap();
+        let frame = gray_i420(64, 64);
+        let nals = encoder.encode(&frame).unwrap();
+        let sps = nals
+            .iter()
+            .find(|nal| nal.first().is_some_and(|byte| byte & 0x1f == 7))
+            .expect("startup frame should contain an SPS");
+
+        assert!(sps.len() >= 4);
+        assert_eq!(sps[1], 66, "expected H.264 Baseline profile_idc");
+        assert_ne!(
+            sps[2] & 0x40,
+            0,
+            "constraint_set1_flag must be set for constrained baseline"
+        );
+    }
+
+    #[test]
+    fn force_intra_frame_emits_idr() {
+        let mut encoder = H264Encoder::new(64, 64, 30.0, 256).unwrap();
+        let frame = gray_i420(64, 64);
+        let _ = encoder.encode(&frame).unwrap();
+        encoder.force_intra_frame();
+
+        let nals = encoder.encode(&frame).unwrap();
+        assert!(nals
+            .iter()
+            .any(|nal| nal.first().is_some_and(|byte| byte & 0x1f == 5)));
     }
 }

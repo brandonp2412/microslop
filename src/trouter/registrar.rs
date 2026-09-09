@@ -1,35 +1,7 @@
 //! Trouter registrar — registers our endpoint with the Teams notification service
 
 use anyhow::{Context, Result};
-
-/// Registration entry: appId, templateKey, path suffix, context
-struct RegEntry {
-    app_id: &'static str,
-    template_key: &'static str,
-    path_suffix: &'static str,
-    context: &'static str,
-}
-
-const REGISTRATIONS: &[RegEntry] = &[
-    RegEntry {
-        app_id: "TeamsCDLWebWorker",
-        template_key: "TeamsCDLWebWorker_2.6",
-        path_suffix: "",
-        context: "TFL",
-    },
-    RegEntry {
-        app_id: "SkypeSpacesWeb",
-        template_key: "SkypeSpacesWeb_2.4",
-        path_suffix: "SkypeSpacesWeb",
-        context: "",
-    },
-    RegEntry {
-        app_id: "NextGenCalling",
-        template_key: "DesktopNgc_2.5:SkypeNgc",
-        path_suffix: "NGCallManagerWin",
-        context: "",
-    },
-];
+use ost_microsoft::calling as microsoft_calling;
 
 /// Register our trouter endpoint with the Teams registrar service.
 ///
@@ -43,49 +15,46 @@ pub async fn register(
 ) -> Result<()> {
     let url = registrar_url.trim_end_matches('/').to_string();
 
-    for entry in REGISTRATIONS {
+    for entry in microsoft_calling::REGISTRATIONS {
         let reg_id = uuid::Uuid::new_v4().to_string();
         let path = format!("{}{}", trouter_surl, entry.path_suffix);
 
-        let payload = serde_json::json!({
-            "clientDescription": {
-                "appId": entry.app_id,
-                "aesKey": "",
-                "languageId": "en-US",
-                "platform": "edge",
-                "templateKey": entry.template_key,
-                "platformUIVersion": "49/1.0.0"
-            },
-            "registrationId": reg_id,
-            "nodeId": "",
-            "transports": {
-                "TROUTER": [{
-                    "context": entry.context,
-                    "path": path,
-                    "ttl": 86400
-                }]
-            }
-        });
+        let payload = microsoft_calling::registrar_payload(*entry, &reg_id, &path);
 
         tracing::info!(
             "Registering {} at {} (appId={}, templateKey={})",
-            entry
-                .path_suffix
-                .is_empty()
-                .then_some("base")
-                .unwrap_or(entry.path_suffix),
+            if entry.path_suffix.is_empty() {
+                "base"
+            } else {
+                entry.path_suffix
+            },
             url,
             entry.app_id,
             entry.template_key,
         );
 
-        let resp = http
-            .post(&url)
-            .header("X-Skypetoken", skype_token)
-            .json(&payload)
-            .send()
-            .await
-            .context("Registrar POST failed")?;
+        let mut attempt = 0u8;
+        let resp = loop {
+            attempt += 1;
+            match http
+                .post(&url)
+                .header(microsoft_calling::SKYPE_TOKEN_HEADER, skype_token)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) if attempt < 3 => {
+                    tracing::warn!(
+                        "Registrar transport failed for {} on attempt {attempt}: {error}",
+                        entry.app_id,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
+                        .await;
+                }
+                Err(error) => return Err(error).context("Registrar POST failed"),
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {

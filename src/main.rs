@@ -1,13 +1,18 @@
+#![deny(clippy::allow_attributes)]
+
 //! Teams CLI - Lightweight Microsoft Teams client
 //!
 //! A terminal-based Teams client for Linux.
 
 mod api;
 mod auth;
-mod calling;
+mod calling {
+    pub use teams_cli::calling::*;
+}
 mod config;
-mod models;
-mod trouter;
+mod trouter {
+    pub use teams_cli::trouter::*;
+}
 mod tui;
 
 use anyhow::Result;
@@ -21,70 +26,53 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with Microsoft Teams
     Login {
         /// Force interactive login even if cached token exists
         #[arg(short, long)]
         force: bool,
+
+        #[arg(long)]
+        personal: bool,
     },
 
-    /// Log out and clear cached credentials
     Logout,
 
-    /// Show current authentication status
     Status,
 
-    /// List recent chats
     Chats {
-        /// Maximum number of chats to show
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
 
-    /// Read messages from a chat
     Read {
         /// Chat thread ID (from `chats` output)
         chat_id: String,
 
-        /// Maximum number of messages to show
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
 
-    /// Send a message
     Send {
         /// Chat thread ID (from `chats` output)
         #[arg(short, long)]
         to: String,
 
-        /// Message content
         message: String,
     },
 
-    /// List joined teams and their channels
     Teams,
 
-    /// Show current user info (verify auth works)
     Whoami,
 
     /// Connect to Trouter WebSocket push service
     Trouter,
 
-    /// Get/set presence status
-    Presence {
-        /// New status: available, busy, dnd, away, offline
-        #[arg(short, long)]
-        set: Option<String>,
-    },
-
-    /// Place a test call to yourself (self-call)
     CallTest {
         /// Duration in seconds to keep the call active
         #[arg(short, long, default_value = "15")]
@@ -101,6 +89,9 @@ enum Commands {
         /// 1:1 chat thread ID to call (e.g., 19:guid1_guid2@unq.gbl.spaces)
         #[arg(long)]
         thread: Option<String>,
+
+        #[arg(long)]
+        callee: Option<String>,
 
         /// Enable camera capture (V4L2) for video send (requires video-capture feature)
         #[arg(long)]
@@ -119,11 +110,9 @@ enum Commands {
     #[cfg(feature = "audio")]
     MicTest,
 
-    /// Test camera capture: record 3 seconds then play back in SDL2 window
-    #[cfg(feature = "video-capture")]
+    #[cfg(any(feature = "video-capture", feature = "video-capture-windows"))]
     CamTest,
 
-    /// Launch the terminal user interface
     Tui,
 }
 
@@ -131,13 +120,9 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging differently for TUI vs CLI mode.
-    // TUI mode captures logs to a buffer (displayed in debug pane).
-    // CLI mode logs to stderr as usual.
     let filter_str = if cli.verbose { "debug" } else { "info" };
 
     if matches!(cli.command, Commands::Tui) {
-        // TUI mode: capture logs to a buffer for in-TUI display.
         let log_buffer = tui::LogBuffer::new();
         tracing_subscriber::registry()
             .with(
@@ -155,7 +140,6 @@ async fn main() -> Result<()> {
         return tui::run(log_buffer).await;
     }
 
-    // CLI mode: log to stderr.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -165,9 +149,9 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Login { force } => {
+        Commands::Login { force, personal } => {
             tracing::info!("Starting authentication flow...");
-            auth::login(force).await?;
+            auth::login(force, personal).await?;
         }
         Commands::Logout => {
             tracing::info!("Logging out...");
@@ -201,33 +185,31 @@ async fn main() -> Result<()> {
             record,
             echo,
             thread,
+            callee,
             camera,
             display,
             tone,
         } => {
-            calling::call_test::run_call_test(
-                duration, record, echo, thread, camera, display, tone,
-            )
+            calling::call_test::run_call_test(calling::call_test::CallTestOptions {
+                duration_secs: duration,
+                record,
+                echo,
+                thread_override: thread,
+                callee_user_id: callee,
+                use_camera: camera,
+                use_display: display,
+                tone_mode: tone,
+            })
             .await?;
         }
         #[cfg(feature = "audio")]
         Commands::MicTest => {
             calling::audio::mic_test()?;
         }
-        #[cfg(feature = "video-capture")]
+        #[cfg(any(feature = "video-capture", feature = "video-capture-windows"))]
         Commands::CamTest => {
             calling::camera::cam_test()?;
         }
-        Commands::Presence { set } => match set {
-            Some(status) => {
-                tracing::info!("Setting presence to {}...", status);
-                api::set_presence(&status).await?;
-            }
-            None => {
-                api::get_presence().await?;
-            }
-        },
-        // TUI is handled above with early return.
         Commands::Tui => unreachable!(),
     }
 

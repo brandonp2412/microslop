@@ -1,33 +1,12 @@
 //! Microsoft Graph API: joined teams and channels
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use ost_microsoft::teams::models::{GraphChannel as Channel, GraphCollection, GraphTeam as Team};
 
 use super::client::TeamsClient;
 
-#[derive(Debug, Deserialize)]
-struct TeamsResponse {
-    value: Vec<Team>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Team {
-    id: String,
-    #[serde(rename = "displayName")]
-    display_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChannelsResponse {
-    value: Vec<Channel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Channel {
-    id: String,
-    #[serde(rename = "displayName")]
-    display_name: Option<String>,
-}
+type TeamsResponse = GraphCollection<Team>;
+type ChannelsResponse = GraphCollection<Channel>;
 
 /// List joined teams and channels (prints to stdout).
 pub async fn list_teams() -> Result<()> {
@@ -53,13 +32,8 @@ pub async fn list_teams() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Data-returning API functions for TUI integration
-// ---------------------------------------------------------------------------
-
 /// Team metadata for TUI display.
 pub struct TeamInfo {
-    pub id: String,
     pub name: String,
     pub channels: Vec<ChannelInfo>,
 }
@@ -108,7 +82,6 @@ pub async fn list_teams_data(client: &TeamsClient) -> Result<Vec<TeamInfo>> {
         };
 
         result.push(TeamInfo {
-            id: team.id.clone(),
             name: team_name,
             channels,
         });

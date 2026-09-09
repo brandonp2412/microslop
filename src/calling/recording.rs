@@ -10,26 +10,29 @@ use chrono::Utc;
 use std::time::Duration;
 
 use super::call_test::extract_call_payload;
-use super::signaling::{
-    self, trouter_callback, ConversationCallParams, SKYPE_CLIENT_HEADER, TEAMS_PARTITION,
-    TEAMS_REGION, TEAMS_RING,
-};
+use super::signaling::{self, trouter_callback, ConversationCallParams};
 use crate::trouter::websocket::TrouterSocket;
+use ost_microsoft::calling as microsoft_calling;
 
-/// Microsoft's well-known recorder bot MRI (from captured Teams client traffic).
-const RECORDER_BOT_MRI: &str = "28:bdd75849-e0a6-4cce-8fc1-d7c0d4da43e5";
-
-/// FlightProxy recorder service base URL.
-/// Captured from USEA region; other regions use different hostnames
-/// (e.g. aks-prod-euwe-* for West Europe). TODO: derive from region config.
-const RECORDER_SERVICE_BASE: &str =
-    "https://api.flightproxy.teams.microsoft.com/api/v2/ep/aks-prod-usea-p08-api.callrecorder.teams.cloud.microsoft:23444";
-
-/// Delay between transcription start and recording start.
 /// Teams web client waits ~11s, but we use 2s to race against solo-call teardown.
 const TRANSCRIPTION_TO_RECORDING_DELAY_SECS: u64 = 2;
 
-/// Parameters needed for the recording flow.
+pub struct RecordingRequest<'a> {
+    pub caller_mri: &'a str,
+    pub participant_id: &'a str,
+    pub endpoint_id: &'a str,
+    pub chain_id: &'a str,
+    pub message_id: &'a str,
+    pub thread_id: &'a str,
+    pub display_name: &'a str,
+    pub trouter_surl: &'a str,
+    pub ic3_token: &'a str,
+    pub recorder_token: &'a str,
+    pub skype_token: &'a str,
+    pub conversation_controller: &'a str,
+    pub add_participant_url_override: Option<&'a str>,
+}
+
 pub struct RecordingParams<'a> {
     pub caller_mri: &'a str,
     pub participant_id: &'a str,
@@ -42,30 +45,8 @@ pub struct RecordingParams<'a> {
     pub ic3_token: &'a str,
     pub recorder_token: &'a str,
     pub skype_token: &'a str,
-    /// The conversation ID from the phase 1/2 response (extracted from conversationController URL).
     pub conversation_id: &'a str,
-    /// The addParticipantAndModality URL (derived from conversationController).
     pub add_participant_url: &'a str,
-}
-
-/// Base recorder feature flags (shared between bot invitation and recording start).
-fn recorder_features() -> serde_json::Value {
-    serde_json::json!({
-        "enablePPTSharing": true,
-        "intermediateLiveCaptions": false,
-        "actionItemsEnabled": false,
-        "enableEmailAndMeetingLanguageModel": true,
-        "ceoSummit": false,
-        "useUnmixedAudio": true,
-        "enableTranscriptMeetingChaptering": false
-    })
-}
-
-/// Recording-specific features (base flags + recordingMode).
-fn recording_features() -> serde_json::Value {
-    let mut map = recorder_features();
-    map["recordingMode"] = serde_json::json!("Normal");
-    map
 }
 
 /// Step 1: Add the recorder bot as a call participant.
@@ -79,50 +60,23 @@ pub async fn add_recorder_bot(
     let tc = |path: &str| trouter_callback(params.trouter_surl, params.endpoint_id, path);
 
     // Payload matches real Teams web client capture (reqid 4222).
-    // Key differences from addParticipantAndModality: no groupChat/groupContext,
     // has debugContent, uses /addParticipant endpoint.
-    let payload = serde_json::json!({
-        "disableUnmute": false,
-        "participants": {
-            "from": {
-                "id": params.caller_mri,
-                "displayName": params.display_name,
-                "endpointId": params.endpoint_id,
-                "participantId": params.participant_id,
-                "languageId": "en-US"
-            },
-            "to": [{
-                "id": RECORDER_BOT_MRI,
-                "participantId": bot_participant_id
-            }]
+    let payload = microsoft_calling::add_recorder_payload(
+        &microsoft_calling::RecorderPayloadContext {
+            caller_mri: params.caller_mri,
+            display_name: params.display_name,
+            endpoint_id: params.endpoint_id,
+            participant_id: params.participant_id,
+            chain_id: params.chain_id,
+            thread_id: params.thread_id,
+            recorder_token: params.recorder_token,
         },
-        "participantInvitationData": {
-            "botData": {
-                "meetingTitle": "",
-                "clientInfo": "Teams-R4",
-                "callId": params.chain_id,
-                "threadId": params.thread_id,
-                "recorderFeatures": recorder_features(),
-                "mode": "RecordingAndTranscription",
-                "iCalUid": null,
-                "consumerType": "Teams",
-                "spokenLanguage": "en-us",
-                "initiatorUserToken": params.recorder_token,
-                "exchangeId": null,
-                "meetingOrganizer": params.display_name
-            }
-        },
-        "replacementDetails": null,
-        "links": {
-            "addParticipantSuccess": tc("conversation/addParticipantSuccess/"),
-            "addParticipantFailure": tc("conversation/addParticipantFailure/")
-        },
-        "debugContent": {}
-    });
+        &bot_participant_id,
+        &tc,
+    );
 
     // Generate a fresh message-id for this request.  The conv server uses
     // x-microsoft-skype-message-id for deduplication; reusing the call-placement
-    // message-id causes "cached-response" with an empty body.
     let recorder_message_id = uuid::Uuid::new_v4().to_string();
 
     tracing::info!(
@@ -139,13 +93,28 @@ pub async fn add_recorder_bot(
         .post(params.add_participant_url)
         .header("Authorization", format!("Bearer {}", params.ic3_token))
         .header("Content-Type", "application/json")
-        .header("x-microsoft-skype-chain-id", params.chain_id)
-        .header("x-microsoft-skype-message-id", &recorder_message_id)
-        .header("x-microsoft-skype-client", SKYPE_CLIENT_HEADER)
-        .header("ms-teams-partition", TEAMS_PARTITION)
-        .header("ms-teams-region", TEAMS_REGION)
-        .header("ms-teams-ring", TEAMS_RING)
-        .header("x-ms-migration", "True")
+        .header(microsoft_calling::CHAIN_ID_HEADER, params.chain_id)
+        .header(microsoft_calling::MESSAGE_ID_HEADER, &recorder_message_id)
+        .header(
+            microsoft_calling::CLIENT_HEADER,
+            microsoft_calling::SKYPE_CLIENT_HEADER,
+        )
+        .header(
+            microsoft_calling::PARTITION_HEADER,
+            microsoft_calling::TEAMS_PARTITION,
+        )
+        .header(
+            microsoft_calling::REGION_HEADER,
+            microsoft_calling::TEAMS_REGION,
+        )
+        .header(
+            microsoft_calling::RING_HEADER,
+            microsoft_calling::TEAMS_RING,
+        )
+        .header(
+            microsoft_calling::MIGRATION_HEADER,
+            microsoft_calling::MIGRATION_VALUE,
+        )
         .json(&payload)
         .send()
         .await
@@ -163,7 +132,7 @@ pub async fn add_recorder_bot(
         );
     }
     if resp_headers
-        .get("x-microsoft-skype-cached-response")
+        .get(microsoft_calling::CACHED_RESPONSE_HEADER)
         .is_some()
     {
         tracing::warn!("Server returned cached response — message-id may have been reused");
@@ -182,7 +151,6 @@ pub async fn add_recorder_bot(
         "Recorder bot response (first 2000): {}",
         &body[..body.len().min(2000)]
     );
-    // Dump full response for protocol analysis
     if let Ok(()) = std::fs::write("/tmp/add_recorder_response.json", &body) {
         tracing::info!("Full add-recorder response saved to /tmp/add_recorder_response.json");
     }
@@ -195,25 +163,21 @@ async fn start_transcription_at(
     params: &RecordingParams<'_>,
     recorder_base: &str,
 ) -> Result<()> {
-    let url = format!("{}/v2/oncommand/{}", recorder_base, params.conversation_id);
-
-    let payload = serde_json::json!({
-        "timestamp": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "participantMri": params.caller_mri,
-        "participantLegId": params.participant_id,
-        "action": "start",
-        "mode": "transcription",
-        "processingModes": ["closedCaptions"],
-        "participantSkypeToken": ""
-    });
+    let url = microsoft_calling::recorder_command_url(recorder_base, params.conversation_id);
+    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let payload = microsoft_calling::start_transcription_payload(
+        &timestamp,
+        params.caller_mri,
+        params.participant_id,
+    );
 
     tracing::info!("Starting transcription -> POST {}", url);
 
     let resp = http
         .post(&url)
         .header("Authorization", format!("Bearer {}", params.recorder_token))
-        .header("x-skypetoken", params.skype_token)
-        .header("x-microsoft-skype-chain-id", params.chain_id)
+        .header(microsoft_calling::SKYPE_TOKEN_HEADER, params.skype_token)
+        .header(microsoft_calling::CHAIN_ID_HEADER, params.chain_id)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -241,42 +205,27 @@ async fn start_recording_at(
     params: &RecordingParams<'_>,
     recorder_base: &str,
 ) -> Result<()> {
-    let url = format!("{}/v2/oncommand/{}", recorder_base, params.conversation_id);
-
+    let url = microsoft_calling::recorder_command_url(recorder_base, params.conversation_id);
     let correlation_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
     let date_str = now.format("%Y%m%dT%H%M%S").to_string();
     let file_name = format!("Meeting in \"av-test\"-{}-Meeting Recording", date_str);
-
-    let payload = serde_json::json!({
-        "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "participantMri": params.caller_mri,
-        "participantLegId": params.participant_id,
-        "action": "start",
-        "processingModes": ["recording", "realTimeTranscript"],
-        "actionParameters": {
-            "recordingFeatures": recording_features(),
-            "recordingStorageSettings": [{
-                "StorageType": "OnedriveForBusiness",
-                "StorageLocation": "Recordings",
-                "FileName": file_name,
-                "GroupId": null
-            }],
-            "correlationId": correlation_id,
-            "meetingTitle": "Meeting in \"av-test\"",
-            "spokenLanguage": "en-us",
-            "type": "start"
-        },
-        "participantSkypeToken": ""
-    });
+    let timestamp = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let payload = microsoft_calling::start_recording_payload(
+        &timestamp,
+        params.caller_mri,
+        params.participant_id,
+        &file_name,
+        &correlation_id,
+    );
 
     tracing::info!("Starting recording -> POST {}", url);
 
     let resp = http
         .post(&url)
         .header("Authorization", format!("Bearer {}", params.recorder_token))
-        .header("x-skypetoken", params.skype_token)
-        .header("x-microsoft-skype-chain-id", params.chain_id)
+        .header(microsoft_calling::SKYPE_TOKEN_HEADER, params.skype_token)
+        .header(microsoft_calling::CHAIN_ID_HEADER, params.chain_id)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -306,29 +255,17 @@ async fn start_recording_at(
 pub async fn start_call_recording(
     http: &reqwest::Client,
     ws: &mut TrouterSocket,
-    conversation_controller: &str,
-    caller_mri: &str,
-    participant_id: &str,
-    endpoint_id: &str,
-    chain_id: &str,
-    message_id: &str,
-    thread_id: &str,
-    display_name: &str,
-    trouter_surl: &str,
-    ic3_token: &str,
-    recorder_token: &str,
-    skype_token: &str,
-    add_participant_url_override: Option<&str>,
+    request: RecordingRequest<'_>,
 ) -> Result<RecordingSession> {
     // Use the exact addParticipant URL from the epconv response if available,
     // otherwise derive it from conversationController as a fallback.
-    let add_url = match add_participant_url_override {
+    let add_url = match request.add_participant_url_override {
         Some(url) => {
             tracing::info!("Using addParticipant URL from epconv response: {}", url);
             url.to_string()
         }
         None => {
-            let derived = derive_add_participant_url_for_bot(conversation_controller);
+            let derived = derive_add_participant_url_for_bot(request.conversation_controller);
             tracing::info!(
                 "Derived addParticipant URL (no link in response): {}",
                 derived
@@ -337,28 +274,27 @@ pub async fn start_call_recording(
         }
     };
 
-    let placeholder_conv_id =
-        extract_conversation_id(conversation_controller).unwrap_or_else(|| "unknown".to_string());
+    let placeholder_conv_id = extract_conversation_id(request.conversation_controller)
+        .unwrap_or_else(|| "unknown".to_string());
 
     let params = RecordingParams {
-        caller_mri,
-        participant_id,
-        endpoint_id,
-        chain_id,
-        message_id,
-        thread_id,
-        display_name,
-        trouter_surl,
-        ic3_token,
-        recorder_token,
-        skype_token,
+        caller_mri: request.caller_mri,
+        participant_id: request.participant_id,
+        endpoint_id: request.endpoint_id,
+        chain_id: request.chain_id,
+        message_id: request.message_id,
+        thread_id: request.thread_id,
+        display_name: request.display_name,
+        trouter_surl: request.trouter_surl,
+        ic3_token: request.ic3_token,
+        recorder_token: request.recorder_token,
+        skype_token: request.skype_token,
         conversation_id: &placeholder_conv_id,
         add_participant_url: &add_url,
     };
 
     tracing::info!("Starting recording flow (add URL: {})", add_url);
 
-    // Step 1: Add recorder bot — the response body contains the full conversation state
     // including the recorder bot's participant entry with its conversationController URL.
     let add_response = add_recorder_bot(http, &params).await?;
 
@@ -376,17 +312,18 @@ pub async fn start_call_recording(
             tracing::info!("Recorder URL not in HTTP response, waiting on Trouter (30s)...");
             // Build ConversationCallParams for acknowledging callAcceptance frames
             let conv_params = ConversationCallParams {
-                ic3_token,
-                trouter_surl,
-                caller_mri,
-                caller_display_name: display_name,
-                endpoint_id,
-                participant_id,
-                thread_id,
-                chain_id,
-                message_id,
-                caller_oid: "", // not needed for acknowledgement
-                tenant_id: "",  // not needed for acknowledgement
+                call_token: params.ic3_token,
+                personal: false,
+                trouter_surl: params.trouter_surl,
+                caller_mri: params.caller_mri,
+                caller_display_name: params.display_name,
+                endpoint_id: params.endpoint_id,
+                participant_id: params.participant_id,
+                thread_id: params.thread_id,
+                chain_id: params.chain_id,
+                message_id: params.message_id,
+                caller_oid: "",
+                tenant_id: "",
             };
             wait_for_recorder_info(ws, Duration::from_secs(30), http, &conv_params).await
         }
@@ -409,16 +346,13 @@ pub async fn start_call_recording(
         }
     };
 
-    // Rebuild params with actual recorder conversation ID
     let params = RecordingParams {
         conversation_id: &recorder_conv_id,
         ..params
     };
 
-    // Step 3: Start transcription
     start_transcription_at(http, &params, &recorder_base).await?;
 
-    // Step 4: Wait then start recording
     tracing::info!(
         "Waiting {}s before starting recording...",
         TRANSCRIPTION_TO_RECORDING_DELAY_SECS
@@ -431,15 +365,14 @@ pub async fn start_call_recording(
     Ok(RecordingSession {
         recorder_base,
         conversation_id: recorder_conv_id,
-        recorder_token: recorder_token.to_string(),
-        skype_token: skype_token.to_string(),
-        chain_id: chain_id.to_string(),
-        caller_mri: caller_mri.to_string(),
-        participant_id: participant_id.to_string(),
+        recorder_token: request.recorder_token.to_string(),
+        skype_token: request.skype_token.to_string(),
+        chain_id: request.chain_id.to_string(),
+        caller_mri: request.caller_mri.to_string(),
+        participant_id: request.participant_id.to_string(),
     })
 }
 
-/// Active recording session info needed to stop recording.
 pub struct RecordingSession {
     pub recorder_base: String,
     pub conversation_id: String,
@@ -450,22 +383,15 @@ pub struct RecordingSession {
     pub participant_id: String,
 }
 
-/// Stop recording and transcription for an active session.
 pub async fn stop_call_recording(http: &reqwest::Client, session: &RecordingSession) -> Result<()> {
-    let url = format!(
-        "{}/v2/oncommand/{}",
-        session.recorder_base, session.conversation_id
+    let url =
+        microsoft_calling::recorder_command_url(&session.recorder_base, &session.conversation_id);
+    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let payload = microsoft_calling::stop_recording_payload(
+        &timestamp,
+        &session.caller_mri,
+        &session.participant_id,
     );
-
-    // Stop recording first
-    let payload = serde_json::json!({
-        "timestamp": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "participantMri": session.caller_mri,
-        "participantLegId": session.participant_id,
-        "action": "stop",
-        "processingModes": ["recording", "realTimeTranscript"],
-        "participantSkypeToken": ""
-    });
 
     tracing::info!("Stopping recording -> POST {}", url);
     let resp = http
@@ -474,8 +400,8 @@ pub async fn stop_call_recording(http: &reqwest::Client, session: &RecordingSess
             "Authorization",
             format!("Bearer {}", session.recorder_token),
         )
-        .header("x-skypetoken", &session.skype_token)
-        .header("x-microsoft-skype-chain-id", &session.chain_id)
+        .header(microsoft_calling::SKYPE_TOKEN_HEADER, &session.skype_token)
+        .header(microsoft_calling::CHAIN_ID_HEADER, &session.chain_id)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -489,16 +415,12 @@ pub async fn stop_call_recording(http: &reqwest::Client, session: &RecordingSess
         &body[..body.len().min(200)]
     );
 
-    // Stop transcription
-    let payload = serde_json::json!({
-        "timestamp": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "participantMri": session.caller_mri,
-        "participantLegId": session.participant_id,
-        "action": "stop",
-        "mode": "transcription",
-        "processingModes": ["closedCaptions"],
-        "participantSkypeToken": ""
-    });
+    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let payload = microsoft_calling::stop_transcription_payload(
+        &timestamp,
+        &session.caller_mri,
+        &session.participant_id,
+    );
 
     tracing::info!("Stopping transcription -> POST {}", url);
     let resp = http
@@ -507,8 +429,8 @@ pub async fn stop_call_recording(http: &reqwest::Client, session: &RecordingSess
             "Authorization",
             format!("Bearer {}", session.recorder_token),
         )
-        .header("x-skypetoken", &session.skype_token)
-        .header("x-microsoft-skype-chain-id", &session.chain_id)
+        .header(microsoft_calling::SKYPE_TOKEN_HEADER, &session.skype_token)
+        .header(microsoft_calling::CHAIN_ID_HEADER, &session.chain_id)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -544,23 +466,19 @@ async fn wait_for_recorder_info(
             frame = ws.recv_frame() => {
                 match frame {
                     Ok(Some(text)) => {
-                        // Respond to heartbeats
                         if text.starts_with("2::") {
                             ws.send_text("2::").await.ok();
                             continue;
                         }
 
-                        // Skip non-data frames
                         if text.starts_with("5:") && !text.contains("callAgent") {
                             continue;
                         }
 
-                        // Log every frame for debugging
                         let trunc: String = text.chars().take(300).collect();
                         tracing::info!("Recording wait frame (len={}): {}", text.len(), trunc);
 
                         // Decompress and parse every data frame (3::: frames are gzip-compressed,
-                        // so checking raw text for strings like RECORDER_BOT_MRI won't work)
                         if let Some(payload) = extract_call_payload(&text) {
                             // Acknowledge any callAcceptance frames (e.g. triggered by recorder bot joining).
                             // Without this, CC kills the call with 430/10065 after ~20s.
@@ -583,18 +501,13 @@ async fn wait_for_recorder_info(
                             let payload_str = serde_json::to_string(&payload).unwrap_or_default();
 
                             // Check if this frame contains the recorder bot or callrecorder URL
-                            if payload_str.contains(RECORDER_BOT_MRI)
-                                || payload_str.contains("callrecorder")
-                                || payload_str.contains("addParticipantSuccess")
-                            {
+                            if microsoft_calling::is_recorder_payload(&payload_str) {
                                 tracing::info!("Found recorder-related Trouter frame");
-                                // Save full payload for analysis
                                 std::fs::write("/tmp/recorder_trouter_payload.json", &payload_str).ok();
                                 if let Some(result) = extract_recorder_from_payload(&payload) {
                                     return Some(result);
                                 }
                             } else {
-                                // Save every payload for offline analysis
                                 static FRAME_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                                 let n = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 std::fs::write(format!("/tmp/recorder_frame_{}.json", n), &payload_str).ok();
@@ -622,7 +535,6 @@ async fn wait_for_recorder_info(
 
 /// Extract recorder service base URL and conversation ID from a Trouter callback payload.
 ///
-/// The payload from addParticipantSuccess/conversationUpdate contains participants.
 /// The recorder bot (28:bdd75849-...) has a `conversationController` URL like:
 /// `https://api.flightproxy.teams.microsoft.com/api/v2/ep/{recorder-host}:{port}/...`
 /// We extract the FlightProxy base + ep hostname:port as the recorder service base,
@@ -633,43 +545,22 @@ fn extract_recorder_from_payload(payload: &serde_json::Value) -> Option<(String,
 
     // Look for callrecorder hostname pattern in the payload
     // Pattern: aks-prod-XXXX-pNN-api.callrecorder.teams.cloud.microsoft:NNNNN
-    if let Some(idx) = payload_str.find("callrecorder.teams.cloud.microsoft") {
-        // Find the start of the hostname (aks-prod-...)
-        let before = &payload_str[..idx];
-        if let Some(host_start) = before.rfind("aks-prod-") {
-            let after = &payload_str[idx..];
-            // Find end of port (next / or " or space)
-            if let Some(port_end) = after.find(|c: char| c == '/' || c == '"' || c == ' ') {
-                let hostname_port = &payload_str[host_start..idx + port_end];
-                let recorder_base = format!(
-                    "https://api.flightproxy.teams.microsoft.com/api/v2/ep/{}",
-                    hostname_port
-                );
-                tracing::debug!("Found recorder hostname: {}", hostname_port);
-
-                // Now find conversation ID: look for /v2/oncommand/{uuid} or /conv/{id}
-                // The conversation ID for the recorder is typically a UUID in the URL
-                // Or search for a UUID pattern near callrecorder
-                if let Some(conv_id) = extract_recorder_conv_id(&payload_str) {
-                    return Some((recorder_base, conv_id));
-                }
-            }
+    if let Some(recorder_base) = microsoft_calling::recorder_base_from_payload(&payload_str) {
+        if let Some(conv_id) = extract_recorder_conv_id(&payload_str) {
+            return Some((recorder_base, conv_id));
         }
     }
 
     // Fallback: search for any conversationController URL with callrecorder
-    // Also try to find the recording session conversation ID from other fields
     tracing::debug!(
         "Could not find callrecorder URL in payload, searching for conv ID patterns..."
     );
 
     // Try to extract conversation ID from conversationController URL of the recorder bot
-    // The bot's conv controller has a different conv ID than ours
     if let Some(participants) = payload.get("participants").and_then(|p| p.as_array()) {
         for p in participants {
             let id = p.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            if id == RECORDER_BOT_MRI {
-                // Found recorder bot participant - look for its conversation details
+            if id == microsoft_calling::RECORDER_BOT_MRI {
                 if let Some(cc) = p
                     .pointer("/endpoints/0/conversationController")
                     .or_else(|| p.get("conversationController"))
@@ -679,8 +570,7 @@ fn extract_recorder_from_payload(payload: &serde_json::Value) -> Option<(String,
                     // Extract conv ID and recorder service URL from this
                     let conv_id = extract_conversation_id(cc);
                     if let Some(cid) = conv_id {
-                        // Derive recorder base from the conv controller hostname
-                        return Some((RECORDER_SERVICE_BASE.to_string(), cid));
+                        return Some((microsoft_calling::RECORDER_SERVICE_BASE.to_string(), cid));
                     }
                 }
             }
@@ -694,12 +584,9 @@ fn extract_recorder_from_payload(payload: &serde_json::Value) -> Option<(String,
 /// Try to find a recording session conversation ID in a payload string.
 /// Looks for UUID patterns near callrecorder references.
 fn extract_recorder_conv_id(payload: &str) -> Option<String> {
-    // Look for /v2/oncommand/{uuid} pattern
     if let Some(idx) = payload.find("/v2/oncommand/") {
         let after = &payload[idx + "/v2/oncommand/".len()..];
-        let end = after
-            .find(|c: char| c == '"' || c == '/' || c == '?' || c == ' ')
-            .unwrap_or(after.len());
+        let end = after.find(['"', '/', '?', ' ']).unwrap_or(after.len());
         let conv_id = &after[..end];
         if !conv_id.is_empty() {
             tracing::debug!("Found recorder conv ID from oncommand URL: {}", conv_id);
@@ -709,12 +596,10 @@ fn extract_recorder_conv_id(payload: &str) -> Option<String> {
 
     // Look for UUID pattern near callrecorder references
     if let Some(cr_idx) = payload.find("callrecorder") {
-        // Search nearby for UUIDs
         let search_start = cr_idx.saturating_sub(200);
         let search_end = (cr_idx + 400).min(payload.len());
         let search_area = &payload[search_start..search_end];
 
-        // Simple UUID finder
         for (i, _) in search_area.match_indices('-') {
             if i >= 8 && i + 28 <= search_area.len() {
                 let candidate = &search_area[i - 8..i + 28];
@@ -747,10 +632,7 @@ fn extract_conversation_id(url: &str) -> Option<String> {
     let conv_marker = "/conv/";
     let idx = url.find(conv_marker)?;
     let after = &url[idx + conv_marker.len()..];
-    // Take until next '/' or '?' or end
-    let end = after
-        .find(|c: char| c == '/' || c == '?')
-        .unwrap_or(after.len());
+    let end = after.find(['/', '?']).unwrap_or(after.len());
     let b64_id = &after[..end];
     if b64_id.is_empty() {
         return None;
@@ -774,11 +656,22 @@ fn decode_base64_uuid(b64: &str) -> Option<String> {
     // UUID from little-endian bytes (Data1=LE u32, Data2=LE u16, Data3=LE u16, rest=big-endian)
     Some(format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[3], bytes[2], bytes[1], bytes[0],
-        bytes[5], bytes[4],
-        bytes[7], bytes[6],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        bytes[3],
+        bytes[2],
+        bytes[1],
+        bytes[0],
+        bytes[5],
+        bytes[4],
+        bytes[7],
+        bytes[6],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     ))
 }
 

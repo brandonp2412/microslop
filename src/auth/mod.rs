@@ -10,36 +10,28 @@ pub mod tokens;
 pub use oauth::{login, logout, status};
 pub use tokens::{StoredToken, TokenStore};
 
-/// Azure AD client configuration for Teams
+use ost_microsoft::auth;
+
 pub struct AuthConfig {
-    /// OAuth2 client ID (public client)
     pub client_id: &'static str,
-    /// OAuth2 redirect URI
-    pub redirect_uri: &'static str,
-    /// Azure AD tenant (common for multi-tenant)
     pub tenant: &'static str,
-    /// Primary resource scope
     pub scope: &'static str,
 }
 
 impl AuthConfig {
-    /// Config for work/school accounts (Teams desktop client_id)
     pub fn work() -> Self {
         Self {
-            client_id: "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
-            redirect_uri: "https://login.microsoftonline.com/common/oauth2/nativeclient",
+            client_id: auth::WORK_CLIENT_ID,
             tenant: "common",
-            scope: "https://api.spaces.skype.com/.default offline_access",
+            scope: auth::TEAMS_SCOPE,
         }
     }
 
-    /// Config for personal (consumer) accounts
     pub fn personal() -> Self {
         Self {
-            client_id: "8ec6bc83-69c8-4392-8f08-b3c986009232",
-            redirect_uri: "https://login.microsoftonline.com/common/oauth2/nativeclient",
+            client_id: auth::PERSONAL_CLIENT_ID,
             tenant: "consumers",
-            scope: "https://api.spaces.skype.com/.default offline_access",
+            scope: auth::PERSONAL_TEAMS_SCOPE,
         }
     }
 }
